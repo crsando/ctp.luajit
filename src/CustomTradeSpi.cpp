@@ -192,6 +192,7 @@ CUSTOM_ON(OnRspQryInstrument, CThostFtdcInstrumentField);
 CUSTOM_ON(OnRspOrderInsert, CThostFtdcInputOrderField);
 CUSTOM_ON(OnRspOrderAction, CThostFtdcInputOrderActionField);
 CUSTOM_ON(OnRspQryInstrumentMarginRate, CThostFtdcInstrumentMarginRateField);
+CUSTOM_ON(OnRspQryTrade, CThostFtdcTradeField);
 
 
 void CustomTradeSpi::OnRspQryOrder(CThostFtdcOrderField * pField, CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast) {

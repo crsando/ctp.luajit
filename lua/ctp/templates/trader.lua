@@ -527,6 +527,15 @@ function S.query_instrument(symbol)
     end
 end
 
+-- 当日成交（CTP 只返回当前交易日的成交），可选按合约过滤；没有成交时返回空表
+function S.query_trade(symbol)
+    local err, rst = query:request("QryTrade", symbol and { InstrumentID = symbol } or nil)
+    if not rst then
+        return nil, err
+    end
+    return rst
+end
+
 function S.query_order()
     local err, rst = query:request("QryOrder")
     if rst and rst[1] then 
