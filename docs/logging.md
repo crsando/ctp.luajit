@@ -152,5 +152,5 @@ make check-log                         # 与上游逐字比较，不一致时失
 make check-log SERVICE_LUA=/path/to/service.lua
 ```
 
-`SERVICE_LUA` 默认为 `$(HOME)/src/service.lua`。`sync-log` 会拒绝复制上游尚未提交
+`SERVICE_LUA` 默认取 `$(HOME)/src/service.lua` 或 `$(HOME)/Develop/service.lua` 中存在的那个。`sync-log` 会拒绝复制上游尚未提交
 的修改，保证 `log.UPSTREAM` 中记录的 commit 与文件内容对应。

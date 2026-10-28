@@ -14,9 +14,8 @@
 local inspect = require "inspect"
 local ctp = require "ctp"
 
--- 我自己的库，帮我解决一些编码问题
-local iconv = require "iconv"
-local cv, err = iconv.open("UTF-8", "GB18030") -- to, from
+-- CTP 的错误信息是 GBK；用 iconv.lua 转换，不可用时原样保留（见 ctp.gbk）
+local to_utf8 = require("ctp.gbk").to_utf8
 
 -- local service = require "lservice3" .input(...)
 local service = require "service"
@@ -307,7 +306,7 @@ end
 local function rsp_error(rsp)
     local info = rsp.rsp_info
     if info and info.ErrorID ~= 0 then
-        return string.format("%d %s", info.ErrorID, cv and cv:convert(info.ErrorMsg) or info.ErrorMsg)
+        return string.format("%d %s", info.ErrorID, to_utf8(info.ErrorMsg))
     end
     return nil
 end
@@ -513,7 +512,7 @@ function S.query_instrument(symbol)
     local info = {}; do 
         for _, entry in ipairs(rst) do 
             if entry.ProductClass == ctp.THOST_FTDC_PC_Futures then 
-                entry.InstrumentName = cv and cv:convert(entry.InstrumentName) or "" -- workaround for gbk bug
+                entry.InstrumentName = to_utf8(entry.InstrumentName) -- workaround for gbk bug
                 table.insert(info ,entry)
             end
         end
@@ -770,7 +769,7 @@ function R.OnRspOrderAction(rsp) order:update(rsp) end
 function R.OnRspError(rsp)
     local err = rsp_error(rsp)
     if rsp.rsp_info then
-        rsp.rsp_info.ErrorMsg = cv and cv:convert(rsp.rsp_info.ErrorMsg) or rsp.rsp_info.ErrorMsg
+        rsp.rsp_info.ErrorMsg = to_utf8(rsp.rsp_info.ErrorMsg)
     end
     service.log.debug("R.OnRspError: %s", inspect(rsp))
     if pending_start and err then

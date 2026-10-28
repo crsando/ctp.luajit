@@ -15,7 +15,9 @@
  *
  * CTPC_OUTPUT selects the mode (log|null|keep, default log). It is read
  * once, by the first ctp_stdio_init call. Only Linux x86-64 with glibc is
- * supported; elsewhere the output is kept as is.
+ * supported. On macOS (Mach-O, no ELF relocation slots to rewrite) and on
+ * any other platform the output is kept as is, i.e. the module behaves like
+ * CTPC_OUTPUT=keep; see docs/platform-portability.md.
  */
 
 enum { CTP_OUTPUT_KEEP, CTP_OUTPUT_LOG, CTP_OUTPUT_NULL };

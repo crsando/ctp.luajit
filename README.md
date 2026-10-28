@@ -117,13 +117,19 @@ CTP 库会绕过我们的日志系统，直接往 stdout/stderr 写东西，和�
 | `null` | SDK 输出全部丢弃 |
 | `keep` | 不做任何改造，与原版 SDK 行为完全相同 |
 
+### macOS 上不支持
+
+改道依赖 ELF 的重定位表，macOS 是 Mach-O，没有对应的槽可改。**macOS 上自动等于
+`keep`**，启动时记一条 `info`（不是 `warn`）：SDK 的输出照旧写终端。
+见 [`docs/platform-portability.md`](docs/platform-portability.md)。
+
 ### 必须知道的后果
 
 - **终端信息采集并没有因此成功。** 丢弃 `lshw` / `dmidecode` 的报错只是不再显示：
   非 root 运行或未安装 dmidecode 时，上报给期货公司的硬盘序列号、BIOS 序列号、CPU ID
   仍然为空。期货公司要求完整采集信息时，需安装 dmidecode 并以其要求的权限运行。
   想看原始报错：`CTPC_OUTPUT=keep`。
-- **只支持 Linux x86-64 + glibc**，其他平台上自动相当于 `keep`。
+- **只支持 Linux x86-64 + glibc**，其他平台（含 macOS）上自动相当于 `keep`。
 - 覆盖不到：SDK 加载时就缓存起来的 `FILE *`，以及 libc / libstdc++ 内部的输出
   （`std::terminate`、`abort`、断言失败），它们仍写到原 stderr。
 
@@ -152,19 +158,40 @@ make test CTP_VER=<新版本目录>
 
 ## 构建与安装
 
-依赖：gcc/g++、libuv、LuaJIT 2.1（同时用于构建期代码生成），以及 `lib/` 下的 CTP SDK。
+依赖：Linux 上 gcc/g++，macOS 上 Apple clang（`cc`/`c++`，随 Xcode 命令行工具）；
+libuv、LuaJIT 2.1（同时用于构建期代码生成），以及 `lib/` 下的 CTP SDK。
 其他版本的 SDK 放到 `lib/<版本目录>/` 即可用 `CTP_VER` 选择。
 
 ```bash
-make                              # 使用默认 SDK（ctp-6.7.10）
+make                              # 默认 SDK：Linux ctp-6.7.10，macOS ctp-6.7.13-macos
 make CTP_VER=ctp-6.7.11           # 使用 lib/ 下的其他 SDK
 make test                         # C 测试、生成器测试、Lua 离线测试
-sudo make install                 # 安装到 /usr/local
-make help                         # 全部目标和变量
+make install                      # 装到 PATH 里 luajit 所在前缀（Homebrew 为 /opt/homebrew），需要时加 sudo
+make help                         # 全部目标和变量，含 PLATFORM
 ```
 
-构建输出在 `build/<CTP_VER>/`：`libctpc.so`、与它配套生成的 `cdefs.lua`，以及复制过来的
-CTP 动态库。安装后的布局：
+平台由 `uname -s` 自动选择，也可以写成 `PLATFORM=linux|macos`：产物分别是
+`libctpc.so`（ELF，`$ORIGIN` rpath，RELRO）和 `libctpc.dylib`（Mach-O，
+`@loader_path` rpath，`-framework` 链接 SDK）。两种 SDK 不能混用，目录里没有对应平台的库
+会直接报错停下。
+
+### macOS
+
+macOS 的 SDK 是 `.framework` 而不是 `.so`，并且要用 **CTP 6.7.13+**。下载、解压、
+**签名**（不签会被 dyld 拒绝加载）和常见坑见 [`docs/macos-sdk.md`](docs/macos-sdk.md)，
+整体兼容性设计见 [`docs/platform-portability.md`](docs/platform-portability.md)。
+
+```bash
+# lib/ctp-6.7.13-macos/{ThostFtdc*.h, thostmduserapi_se.framework, thosttraderapi_se.framework}
+make CTP_VER=ctp-6.7.13-macos
+make CTP_VER=ctp-6.7.13-macos test
+```
+
+macOS 上已知的差异只有两处：CTP SDK 的输出改道不做（等同 `CTPC_OUTPUT=keep`），
+以及 flow 文件目录用 `$TMPDIR`（macOS 没有 `/dev/shm`，可用 `CTPC_FLOW_DIR` 覆盖）。
+
+构建输出在 `build/<CTP_VER>/`：`libctpc.so`/`libctpc.dylib`、与它配套生成的 `cdefs.lua`，
+以及复制过来的 CTP 动态库。安装后的布局：
 
 ```
 $(PREFIX)/lib/ctp.luajit/<CTP_VER>/   libctpc.so、cdefs.lua、CTP 动态库（每个 SDK 版本一个目录）

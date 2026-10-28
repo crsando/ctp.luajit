@@ -1,9 +1,10 @@
 -- ctp: LuaJIT binding of libctpc, the C bridge to the CTP SDK.
 --
--- libctpc.so and the cdefs.lua generated with it (tools/gen.lua) are loaded
--- from one library directory: $CTPC_LIBDIR, or the one `make install` wrote
--- into ctp.config. The two must come from the same build; ctpc_build_info()
--- is checked against cdefs.lua to make sure.
+-- libctpc.so (Linux) / libctpc.dylib (macOS) and the cdefs.lua generated
+-- with it (tools/gen.lua) are loaded from one library directory:
+-- $CTPC_LIBDIR, or the one `make install` wrote into ctp.config. The two must
+-- come from the same build; ctpc_build_info() is checked against cdefs.lua to
+-- make sure.
 --
 -- The C side logs through the logger shared with service.lua; see
 -- docs/logging.md.
@@ -20,13 +21,18 @@ end
 local LIBDIR = find_libdir()
 local cdefs = assert(loadfile(LIBDIR .. "/cdefs.lua"))()
 ffi.cdef(cdefs.cdef)
-local C = ffi.load(LIBDIR .. "/libctpc.so")
+
+-- libctpc.so on Linux, libctpc.dylib on macOS. The name is spelled out
+-- rather than left to ffi.load's suffix probing: a full path is passed, so
+-- the loader never searches LD_LIBRARY_PATH / DYLD paths.
+local LIBNAME = LIBDIR .. (ffi.os == "OSX" and "/libctpc.dylib" or "/libctpc.so")
+local C = ffi.load(LIBNAME)
 
 do
     local info = ffi.string(C.ctpc_build_info())
     if info ~= cdefs.build_info then
-        error(string.format("ctp: %s/libctpc.so is %q but cdefs.lua is %q; reinstall",
-            LIBDIR, info, cdefs.build_info), 0)
+        error(string.format("ctp: %s is %q but cdefs.lua is %q; reinstall",
+            LIBNAME, info, cdefs.build_info), 0)
     end
 end
 

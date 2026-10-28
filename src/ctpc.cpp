@@ -2,7 +2,10 @@
 #include <stdio.h>
 #include <string>
 
+// malloc.h does not exist on macOS; stdlib.h below declares malloc/free.
+#ifndef __APPLE__
 #include "malloc.h"
+#endif
 #include "string.h"
 #include "stdlib.h"
 
@@ -20,8 +23,28 @@ extern "C" {
 #include "ctp_stdio.h"
 #include "ctpc.h"
 
-// CTP flow files (*.con) go to /dev/shm/<root>/<broker>/<user>/
-#define _FLOW_BASE_ "/dev/shm"
+/*
+ * CTP flow files (*.con) go to <base>/<root>/<broker>/<user>/.
+ *
+ * Linux: /dev/shm, a tmpfs, as the SDK expects.
+ * macOS: there is no /dev/shm; $TMPDIR is a per-user directory under
+ * /var/folders, which is both writable and private, unlike /tmp.
+ * CTPC_FLOW_DIR overrides either.
+ */
+static const char * ctp_flow_base(void) {
+    const char * env = getenv("CTPC_FLOW_DIR");
+    if (env != NULL && env[0] == '/')
+        return env;
+#ifdef __APPLE__
+    env = getenv("TMPDIR");
+    if (env != NULL && env[0] == '/')
+        return env;
+    return "/tmp";
+#else
+    return "/dev/shm";
+#endif
+}
+
 
 // mkdir one level, then make sure it is a real directory owned by us
 static int ctp_flow_mkdir(const char * path) {
@@ -41,10 +64,15 @@ static int ctp_flow_mkdir(const char * path) {
     return 0;
 }
 
-// build /dev/shm/<root>/<broker>/<user>/ (with trailing '/') and create it
+// build <base>/<root>/<broker>/<user>/ (with trailing '/') and create it
 static int ctp_flow_path(char * out, size_t n, const char * root, const char * broker, const char * user) {
     const char * parts[3] = { root, broker, user };
-    size_t len = (size_t)snprintf(out, n, "%s", _FLOW_BASE_);
+    const char * base = ctp_flow_base();
+    size_t len = (size_t)snprintf(out, n, "%s", base);
+
+    // A base from the environment may end with '/'; do not double it.
+    while (len > 1 && out[len - 1] == '/')
+        out[--len] = '\0';
 
     for (int i = 0; i < 3; i++) {
         const char * p = (parts[i] && parts[i][0]) ? parts[i] : "_";
@@ -283,8 +311,10 @@ int ctp_trader_order_insert(ctp_trader_t * t, const char * symbol, double price,
 	strcpy(orderInsertReq.InstrumentID, symbol);
 
     order_ref_i = atoi(t->lst_order_ref) + 1;
-    sprintf(orderInsertReq.OrderRef, "%012d", order_ref_i);
-    sprintf(t->lst_order_ref, "%012d", order_ref_i);
+    // OrderRef is TThostFtdcOrderRefType (13 bytes); snprintf bounds it,
+    // and macOS deprecates sprintf outright.
+    snprintf(orderInsertReq.OrderRef, sizeof(orderInsertReq.OrderRef), "%012d", order_ref_i);
+    snprintf(t->lst_order_ref, sizeof(((ctp_trader_t *)0)->lst_order_ref), "%012d", order_ref_i);
     log_debug("order_ref: %s | %s", orderInsertReq.OrderRef, t->lst_order_ref);
 
     if ( price < 0.0001 ) {

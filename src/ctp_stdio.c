@@ -19,13 +19,16 @@
 #include <elf.h>
 #include <link.h>
 #include <sys/mman.h>
-#endif
-
 // The SDK libraries whose output is redirected.
 static const char *ctp_libraries[] = {
     "libthostmduserapi_se.so",
     "libthosttraderapi_se.so",
 };
+#elif defined(__APPLE__)
+// Mach-O has no ELF relocation slots to rewrite; the SDK's output is kept as
+// is. This is a known limitation, not a failure, so it is logged at info.
+#define CTP_STDIO_MACHO 1
+#endif
 
 // Matched case-insensitively, like the logger's level names.
 static const char *mode_names[] = { "keep", "log", "null" };
@@ -345,6 +348,15 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
 static void
 init(void) {
+#ifdef CTP_STDIO_MACHO
+    // Nothing to patch on Mach-O. Say so once at info rather than warning on
+    // every start: the output being kept is the documented macOS behaviour.
+    // CTPC_OUTPUT is not read at all here, so an invalid value is not
+    // reported either.
+
+    log_info("ctp stdio | macOS: SDK output is kept as is (see docs/logging.md)");
+    return;
+#else
     const char *env = getenv("CTPC_OUTPUT");
     int mode = env != NULL ? ctp_stdio_parse_mode(env) : CTP_OUTPUT_LOG;
 
@@ -362,6 +374,7 @@ init(void) {
         else
             log_warn("ctp stdio | %s | output not redirected (%d)", ctp_libraries[i], n);
     }
+#endif
 }
 
 void

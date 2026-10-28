@@ -6,3 +6,4 @@ build/
 # account credentials never belong in the repository
 accounts.lua
 !lua/ctp/accounts.lua
+.alma-snapshots

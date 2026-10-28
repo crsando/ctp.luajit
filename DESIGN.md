@@ -80,7 +80,25 @@ lib/<CTP_VER>/                         CTP SDK
 
 ### 2.6 CTP SDK 输出改道
 
-见 README 特别提示和 [docs/logging.md](docs/logging.md)。
+见 README 特别提示和 [docs/logging.md](docs/logging.md)。改道操作的是 ELF 重定位表，
+**只在 Linux x86-64 + glibc 上生效**；macOS 上明确降级为 `keep`。
+
+### 2.7 Linux / macOS 双平台 ✅
+
+- 平台由 `uname -s` 决定（`PLATFORM=linux|macos` 可覆盖），差异集中在 Makefile 的一个
+  分支块里：产物扩展名、rpath（`$ORIGIN` / `@loader_path`）、加固选项（FORTIFY、stack-clash、
+  RELRO 是 ELF 专有）、SDK 链接方式（`-l` / `-framework`）。
+- SDK 按平台各放一个 `lib/<CTP_VER>/` 目录，私有安装目录的设计（2.3）不变；混用会直接
+  报错，不会悄悄链接错库。
+- 源码只有两处平台分支：`ctpc.cpp` 的 flow 文件根目录（`$TMPDIR` / `/dev/shm`，可用
+  `CTPC_FLOW_DIR` 覆盖）和 `ctp_stdio.c` 的 Mach-O 降级。
+- Lua 侧按 `ffi.os` 选 `libctpc.so` / `libctpc.dylib`。
+- GBK 转换统一走 `ctp.gbk`，底层是本项目的 `iconv.lua`（`iconv.open` +
+  `converter:convert`）。不需要 lua-iconv 兼容：加载不到时 `to_utf8` 原样返回，
+  `M.available` / `M.error` 说明原因。
+- macOS 需要 CTP 6.7.13+：之前的 mac 版 `ReqUserLogin` 比 Linux 多两个穿透式参数，
+  生成器遇到会明确失败。下载、签名与验证见 [docs/macos-sdk.md](docs/macos-sdk.md)，
+  完整清单见 [docs/platform-portability.md](docs/platform-portability.md)。
 
 ## 3. 已知问题
 

@@ -18,12 +18,8 @@ local config = service.config; do
         config.auto_disconnect = true
     end
 
--- CTP 的错误信息是 GBK；iconv 不可用时原样保留
-local to_utf8; do
-    local ok, iconv = pcall(require, "iconv")
-    local cv = ok and iconv.open("UTF-8", "GB18030")
-    to_utf8 = function (s) return cv and cv:convert(s) or s end
-end
+-- CTP 的错误信息是 GBK；用 iconv.lua 转换，不可用时原样保留（见 ctp.gbk）
+local to_utf8 = require("ctp.gbk").to_utf8
 
 local DEFAULT_START_TIMEOUT_MS = 10000
 local SUBSCRIBE_BATCH = 100
