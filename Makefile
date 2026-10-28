@@ -62,7 +62,7 @@ PKG_LIB_DIR := $(PREFIX)/lib/ctp.luajit/$(CTP_VER)
 INCLUDE_DIR := $(PREFIX)/include/ctp.luajit
 LUA_DIR     := $(PREFIX)/share/lua/5.1/ctp
 
-# Only the public API headers are installed; queue/cond/log/macros are internal.
+# Only the public API headers are installed; msgq/log/macros are internal.
 PUBLIC_HEADERS := $(SRC_DIR)/ctpc.h $(GEN_H)
 CTP_HEADERS    := $(CTP_DIR)/ThostFtdcUserApiDataType.h $(CTP_DIR)/ThostFtdcUserApiStruct.h
 CTP_LIBS       := $(CTP_DIR)/libthostmduserapi_se.so $(CTP_DIR)/libthosttraderapi_se.so
@@ -211,14 +211,15 @@ test-gen: $(TARGET)
 test-lua: all
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/ctp_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_query_test.lua
+	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_start_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/collector_test.lua
 
 # ASan/UBSan: overflows and leaked blocks fail the test too.
-$(TEST_DIR)/ctp_rsp_test: tests/c/ctp_rsp_test.c $(SRC_DIR)/trader.c $(SRC_DIR)/queue.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)
+$(TEST_DIR)/ctp_rsp_test: tests/c/ctp_rsp_test.c $(SRC_DIR)/trader.c $(SRC_DIR)/msgq.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)
 	$(CC) $(ALL_CPPFLAGS) -std=gnu11 $(WARN_FLAGS) -O1 -g -fno-omit-frame-pointer \
 		-fsanitize=address,undefined -o $@ $(filter %.c,$^) -luv -lpthread
 
-$(TEST_DIR)/msgq_test: tests/c/msgq_test.c $(SRC_DIR)/msgq.c $(SRC_DIR)/md.c $(SRC_DIR)/trader.c $(SRC_DIR)/queue.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)
+$(TEST_DIR)/msgq_test: tests/c/msgq_test.c $(SRC_DIR)/msgq.c $(SRC_DIR)/md.c $(SRC_DIR)/trader.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)
 	$(CC) $(ALL_CPPFLAGS) -std=gnu11 $(WARN_FLAGS) -O1 -g -fno-omit-frame-pointer \
 		-fsanitize=address,undefined -o $@ $(filter %.c,$^) -luv -lpthread
 

@@ -65,7 +65,20 @@ lib/<CTP_VER>/                         CTP SDK
 - 订阅集合由 Lua 维护（C 侧不再保存），启动前、断线期间的 `subscribe` 都只记入集合，登录后统一发送。
 - 前置地址没有 `protocol://` 时 SDK 的 `RegisterFront` 会段错误，Lua 和 C 两层都在调用前拒绝。
 
-### 2.5 CTP SDK 输出改道
+### 2.5 交易侧：登录链路事件化与启动 ✅
+
+- 与 2.4 同一模式：`ctp_trader_t.state` 为枚举（`DISCONNECTED / CONNECTED / AUTHENTICATED /
+  LOGGED_IN / READY`），登录链路每一步作为消息入队，失败带错误码；链路中的请求发不出时补发
+  负错误码的失败消息。删除阻塞的 `ctp_trader_wait_for_settle`。
+- 交易侧改用 `msgq`，交易回报不设上限、永不丢弃。
+- `S.start{ timeout }`：结算确认完成即成功；任一步失败或超时自动 stop。超时时附上启动期间
+  最后一个错误（`OnRspError`、断线原因），例如 SDK 与前置不匹配的握手失败 4040。
+- 启动和重连时私有流重放的委托/成交照常交给订单簿（不再在启动期间丢弃）。
+- 断线时正在执行的查询立即失败；未启动时查询立即失败。
+- `OnRtnOrder` 只接受本会话（FrontID+SessionID 匹配）且更大的 OrderRef，避免重放的旧订单
+  把 `lst_order_ref` 拉回去造成重复引用（#11 的一部分）。
+
+### 2.6 CTP SDK 输出改道
 
 见 README 特别提示和 [docs/logging.md](docs/logging.md)。
 
@@ -84,20 +97,19 @@ lib/<CTP_VER>/                         CTP SDK
 | 8 | 订单终态 | 只在 `OnRtnTrade` 判断全成，`OnRtnOrder(AllTraded)` 晚到时订单永不结束 | 第二轮 |
 | 9 | 撤单回报 | `OnRspOrderAction` 回显 FrontID/SessionID=0，生成垃圾 key，撤单失败不通知原订单 | 第二轮 |
 | 10 | 超时撤单 | OrderSysID 可能为空；定时器不取消；`_status` 无后续处理 | 第二轮 |
-| 11 | OrderRef | `OnRtnOrder`（含 RESTART 重放）覆盖 `lst_order_ref`；Lua 在调用后读取，与 SPI 线程竞态 | 第二轮：OrderRef 移到 Lua，报单走 `req("OrderInsert")` |
+| 11 | OrderRef | `OnRtnOrder`（含 RESTART 重放）覆盖 `lst_order_ref`；Lua 在调用后读取，与 SPI 线程竞态 | 重放覆盖 ✅（2.5）；竞态留到第二轮：OrderRef 移到 Lua，报单走 `req("OrderInsert")` |
 | 12 | 市价单 | 价格为 0 时用 `LastPrice` + IOC，上期所/能源中心等会拒单 | 第二轮：报单语义移到 Lua，按交易所处理 |
 | 13 | `nuke` | 用 `OF_Close` 平仓，上期所/能源中心平今失败；查询失败时 `ipairs(nil)` | 第二轮 |
 | 14 | 改密 | 请求发出即改缓存密码，失败后重连用错密码 | 第二轮：收到成功回报后再改 |
 | 15 | 改密回报 | 不推给 Lua，用 `std::cout` 输出 | 第二轮 |
 | 16 | req_id | 跨线程非原子递增 | ✅ 第一轮：`__atomic_add_fetch` |
-| 17 | 登录 | `start(true)` 无超时；认证/登录/结算失败不推消息，service 线程永久阻塞 | 行情侧 ✅（2.4）；交易侧第二轮，按同样的模式 |
+| 17 | 登录 | `start(true)` 无超时；认证/登录/结算失败不推消息，service 线程永久阻塞 | ✅ 行情侧（2.4）、交易侧（2.5） |
 | — | 只读 | `config.read_only or true` 永远为 true 且从未检查 | 第二轮 |
 | — | `query_order` | 只返回第一条委托 | 第二轮 |
 
 ### C 层健壮性（第三轮）
 
-- 交易侧队列满（容量 1023）时静默丢消息并泄漏：改用 `msgq`，交易回报不设上限。
-  行情侧 ✅（2.4，tick 有上限、事件不丢）。
+- ✅ 队列满时静默丢消息并泄漏：两侧都改用 `msgq`；交易回报不设上限，行情 tick 有上限、事件不丢。
 - ✅ 行情断线重连后不重新订阅。
 - ✅ 行情心跳警告把状态置为断开。
 - ✅ 订阅回报中的合约指针可能为 NULL。
@@ -137,5 +149,7 @@ lib/<CTP_VER>/                         CTP SDK
 - `test-gen`：头文件中的 `ReqXxx` 数量与 libctpc.so 导出的包装数量一致（独立于生成器统计）。
 - `test-lua`：绑定层（常量、struct 填充/转换、长度检查、默认字段、未启动时的错误码），
   trader 模板的查询队列（发送失败立即返回、超时不堵队列、迟到的超时和回报不误唤醒），
-  collector 模板的启动与事件（成功、登录被拒、超时、stop、断线重连后按集合重订阅、tick 出错）。
-- 真实前置：`examples/collector_smoke.lua [profile]`，启动、订阅、收 tick，再验证不可达前置的超时失败。
+  collector 模板的启动与事件（成功、登录被拒、超时、stop、断线重连后按集合重订阅、tick 出错），
+  trader 模板的启动（完整登录链路、各步失败、超时并保留原因、stop、重连后的新会话、断线时查询立即失败）。
+- 真实前置：`examples/collector_smoke.lua [profile]`，启动、订阅、收 tick，再验证不可达前置的超时失败；
+  `examples/trader_smoke.lua [profile]`，启动、查询资金和持仓（不下单），同样验证超时失败。

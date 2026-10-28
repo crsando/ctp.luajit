@@ -21,6 +21,9 @@ package.loaded["service"] = {
     -- resuming a finished session raises, so a second wake-up fails the test
     resume_session = function (co, ...) assert(coroutine.resume(co, ...)) end,
     yield_session = coroutine.yield,
+    set_timeout = function (ms, cb)
+        return { stop = noop, close = noop }
+    end,
 }
 
 local service = require "service"
@@ -44,13 +47,37 @@ local function spawn(f, ...)
     end
 end
 
+-- Drive the uv loop until cond() holds, at most 5 s.
+local function wait_until(cond, label)
+    local deadline = uv.now() + 5000
+    while not cond() and uv.now() < deadline do
+        uv.run("once")
+        uv.update_time()
+    end
+    t.eq(cond(), true, label)
+end
+
 -- messages the template's on_idle will receive
 local inbox = {}
 trader.recv = function () return table.remove(inbox, 1) end
 
+-- 0. queries before start fail at once; then start, as far as the template
+--    can tell: the C side is never started, so req returns -100
+do
+    local wait = spawn(S.query_account)
+    t.eq(select(2, wait()), "not started", "query before start")
+    t.eq(#timeouts, 0, "no timeout armed before start")
+
+    trader.start = function (self) return self end
+    trader.is_ready = function () return true end
+    local started = spawn(S.start)
+    inbox[#inbox + 1] = { func_name = "OnRspSettlementInfoConfirm", req_id = 3, is_last = true }
+    service.on_idle()
+    t.eq(started(), true, "started")
+end
+
 -- 1. a request that cannot be sent fails at once, and its timeout is ignored
 do
-    trader.trader.connected = 4 -- ready, but never started: req returns -100
     local wait = spawn(S.query_account)
     local rst, err = wait()
     t.eq(rst, nil, "failed send: no result")
@@ -74,13 +101,13 @@ do
     trader.req = function () next_id = next_id + 1; return next_id end
 
     local wait = spawn(S.query_account)
-    while next_id == 100 do uv.run("once") end -- until it has been sent
+    wait_until(function () return next_id ~= 100 end, "request 100 sent") -- until it has been sent
     timeouts[#timeouts]()
     local rst, err = wait()
     t.eq(err, "timedout", "timeout: error")
 
     local wait2 = spawn(S.query_position)
-    while next_id == 101 do uv.run("once") end
+    wait_until(function () return next_id ~= 101 end, "request 101 sent")
     t.eq(next_id, 102, "next request sent after a timeout")
 
     inbox[#inbox + 1] = { func_name = "OnRspQryTradingAccount", req_id = 101, is_last = true, field = {} }
@@ -94,6 +121,40 @@ do
     t.eq(type(pos) == "table" and #pos, 2, "response rows")
     t.eq(pos and pos[2] and pos[2].InstrumentID, "sc2701", "response field")
     timeouts[#timeouts]() -- the second request's timeout, after its response
+end
+
+-- 4. a disconnect fails the request waiting for its response at once; the
+--    next one waits in the queue until the trader is ready again
+do
+    local next_id = 200
+    local ready = true
+    trader.req = function () next_id = next_id + 1; return next_id end
+    trader.is_ready = function () return ready end
+
+    local wait = spawn(S.query_account)
+    wait_until(function () return next_id ~= 200 end, "request 200 sent")
+    local wait2 = spawn(S.query_position)
+
+    ready = false
+    inbox[#inbox + 1] = { func_name = "OnFrontDisconnected", req_id = -1, is_last = true,
+        rsp_info = { ErrorID = 0x1001, ErrorMsg = "disconnected" } }
+    service.on_idle()
+    t.eq(select(2, wait()), "disconnected", "in-flight query fails on disconnect")
+    t.eq(S.status().state, "disconnected", "state after disconnect")
+
+    -- reconnected: the queued query goes out and completes
+    ready = true
+    inbox[#inbox + 1] = { func_name = "OnRspSettlementInfoConfirm", req_id = 4, is_last = true }
+    service.on_idle()
+    t.eq(S.status().reconnects, 1, "reconnect counted")
+    wait_until(function () return next_id ~= 201 end, "request 201 sent")
+    t.eq(next_id, 202, "queued query sent after reconnect")
+    inbox[#inbox + 1] = { func_name = "OnRspQryInvestorPosition", req_id = 202, is_last = true, field = { InstrumentID = "ag2612" } }
+    service.on_idle()
+    local pos = wait2()
+    t.eq(pos and pos[1] and pos[1].InstrumentID, "ag2612", "queued query result after reconnect")
+    timeouts[#timeouts - 1]()
+    timeouts[#timeouts]()
 end
 
 t.done()

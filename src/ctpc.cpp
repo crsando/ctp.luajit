@@ -219,7 +219,9 @@ int ctp_trader_start(ctp_trader_t * trader) {
     if (!ctp_front_addr_ok(trader->front_addr))
         return 0;
 
-    trader->connected = 0;
+    trader->state = CTPC_TRADER_DISCONNECTED;
+    trader->front_id = 0;
+    trader->session_id = 0;
 
     char flow[256];
     if (ctp_flow_path(flow, sizeof(flow), "ctp_trader", trader->broker, trader->user) != 0) {
@@ -230,6 +232,10 @@ int ctp_trader_start(ctp_trader_t * trader) {
 
     ctp_stdio_init();
     CThostFtdcTraderApi * pTradeUserApi = CThostFtdcTraderApi::CreateFtdcTraderApi(flow); // 创建交易实例
+    if (pTradeUserApi == NULL) {
+        log_error("ctp_trader_start | CreateFtdcTraderApi failed");
+        return 0;
+    }
 	CustomTradeSpi *pTradeSpi = new CustomTradeSpi;               // 创建交易回调实例
 
     pTradeSpi->_trader = trader;
@@ -261,7 +267,7 @@ int ctp_trader_stop(ctp_trader_t * trader) {
     if (dropped > 0)
         log_debug("ctp_trader_stop | dropped %d pending messages", dropped);
 
-    trader->connected = 0;
+    trader->state = CTPC_TRADER_DISCONNECTED;
 
     return 1;
 }

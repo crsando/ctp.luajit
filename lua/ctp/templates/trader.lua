@@ -1,3 +1,16 @@
+--
+-- 交易服务模板
+--
+--   S.start { timeout = ms }   连接、认证、登录、结算确认；成功返回 true，
+--                              失败返回 nil, err（此时已经 stop）
+--   S.stop()
+--   S.status()                 状态、会话、重连次数、最近一次错误
+--   S.query_account() ...      查询，按 1 次/秒流控
+--   S.trade(...)               下单并等待结束
+--
+-- 启动成功之后的断线由 CTP 自动重连、libctpc 自动重走登录链路；断线时正在
+-- 执行的查询立即失败，排队中的查询等重新就绪后再发。
+--
 local inspect = require "inspect"
 local ctp = require "ctp"
 
@@ -42,15 +55,16 @@ local server, trader; do
     S._trader = trader -- expose
 end
 
-function S.start()
-    trader:start( true ) -- blocking thread until settlement
-    return true
-end
+local DEFAULT_START_TIMEOUT_MS = 10000
 
-function S.stop()
-    trader:stop()
-    return true
-end
+-- state: stopped | starting | ready | disconnected
+local status = {
+    state = "stopped",
+    since = os.time(),
+    reconnects = 0,  -- 启动成功后重新就绪的次数
+    last_error = nil,
+    session = nil,   -- 最近一次登录：FrontID / SessionID / TradingDay / MaxOrderRef
+}
 
 --
 -- warp query request/response
@@ -90,6 +104,9 @@ local query = {
     --
     -- name 是 CTP 的请求名（ReqXxx 去掉 Req），fields 是请求结构体的字段，见 trader:req()
     request = function(self, name, fields)
+            if status.state == "stopped" or status.state == "starting" then
+                return "not started", nil
+            end
             local co = service.get_session()
 
             local entity = {
@@ -150,6 +167,14 @@ local query = {
                 self:dequeue()
             end
             service.resume_session(entity.session, err, rst)
+        end,
+
+    -- 断线：正在等回报的请求不会再有回报，立即失败；还没发出的留在队列里
+    abort_inflight = function(self, err)
+            local q = self:first()
+            if q and q.req_id and not q.done then
+                self:finish(q, err)
+            end
         end,
 
     enqueue = function(self, entity)
@@ -262,6 +287,181 @@ local query = {
             end
         end,
 } -- end query object definitions
+
+--
+-- 启动与连接状态
+--
+local function set_state(state)
+    if status.state ~= state then
+        service.log.debug("trader | state %s -> %s", status.state, state)
+        status.state = state
+        status.since = os.time()
+    end
+end
+
+local function fail(err)
+    status.last_error = err
+    service.log.error("trader | %s", err)
+end
+
+local function rsp_error(rsp)
+    local info = rsp.rsp_info
+    if info and info.ErrorID ~= 0 then
+        return string.format("%d %s", info.ErrorID, cv and cv:convert(info.ErrorMsg) or info.ErrorMsg)
+    end
+    return nil
+end
+
+local pending_start = nil -- { session, timer, done }
+
+local function stop_trader()
+    query:abort_inflight("stopped")
+    trader:stop()
+    set_state("stopped")
+end
+
+-- start 只结束一次：就绪、登录链路某一步失败、超时或 stop，以先到者为准
+local function finish_start(p, ok, err)
+    if p.done then return end
+    p.done = true
+    pending_start = nil
+    if p.timer then
+        p.timer:stop()
+        p.timer:close()
+        p.timer = nil
+    end
+    if not ok then
+        -- 超时本身说明不了原因，附上启动期间最后一个错误（如前置握手失败）
+        fail("start failed: " .. err .. (p.last_error and (", last error: " .. p.last_error) or ""))
+        stop_trader()
+    end
+    service.resume_session(p.session, ok, err)
+end
+
+-- 登录链路中的一步失败：启动中则 start 失败；重连中则只能等 CTP 下一次重连
+local function chain_failed(step, err)
+    if status.state == "stopped" then return end -- 上一次运行留下的
+    err = step .. " failed: " .. err
+    if pending_start then
+        finish_start(pending_start, nil, err)
+    else
+        fail(err .. " (waiting for the next reconnect)")
+    end
+end
+
+function R.OnFrontConnected(rsp)
+    service.log.debug("trader | front connected, authenticating")
+end
+
+function R.OnRspAuthenticate(rsp)
+    local err = rsp_error(rsp)
+    if err then return chain_failed("authenticate", err) end
+    service.log.debug("trader | authenticated, logging in")
+end
+
+function R.OnRspUserLogin(rsp)
+    local err = rsp_error(rsp) or (rsp.field == nil and "no login response" or nil)
+    if err then return chain_failed("login", err) end
+    local f = rsp.field
+    status.session = {
+        FrontID = f.FrontID,
+        SessionID = f.SessionID,
+        TradingDay = f.TradingDay,
+        MaxOrderRef = f.MaxOrderRef,
+    }
+    service.log.debug("trader | logged in, FrontID %d SessionID %d TradingDay %s, confirming settlement",
+        f.FrontID, f.SessionID, f.TradingDay)
+end
+
+function R.OnRspSettlementInfoConfirm(rsp)
+    local err = rsp_error(rsp)
+    if err then return chain_failed("settlement confirm", err) end
+    if status.state == "stopped" then
+        return -- 上一次运行留下的（stop 已清空队列，正常不会出现）
+    end
+    if status.state == "disconnected" then
+        status.reconnects = status.reconnects + 1
+        service.log.info("trader | ready again (reconnect #%d), SessionID %s",
+            status.reconnects, status.session and status.session.SessionID)
+    else
+        service.log.info("trader | ready")
+    end
+    set_state("ready")
+    if pending_start then
+        finish_start(pending_start, true)
+    end
+end
+
+function R.OnFrontDisconnected(rsp)
+    local err = rsp_error(rsp) or "disconnected"
+    status.last_error = err
+    if pending_start then pending_start.last_error = err end
+    query:abort_inflight("disconnected")
+    -- 启动中的断线不算失败：CTP 会重连，直到 start 超时
+    if status.state == "ready" then
+        service.log.warn("trader | %s, waiting for CTP to reconnect", err)
+        set_state("disconnected")
+    else
+        service.log.debug("trader | %s", err)
+    end
+end
+
+-- opts.timeout: 等待就绪的毫秒数，默认 10000
+function S.start(opts)
+    if status.state == "ready" or status.state == "disconnected" then
+        return true -- 已经在运行；断线时由 CTP 重连
+    end
+    if status.state == "starting" then
+        return nil, "already starting"
+    end
+
+    local timeout = opts and opts.timeout or DEFAULT_START_TIMEOUT_MS
+    set_state("starting")
+    status.last_error = nil
+    status.reconnects = 0
+    status.session = nil
+
+    local ok, err = trader:start()
+    if not ok then
+        fail("start failed: " .. err)
+        stop_trader()
+        return nil, err
+    end
+
+    local p = { session = service.get_session(), done = false }
+    -- set_timeout 的定时器触发后会自己关闭
+    p.timer = service.set_timeout(timeout, function ()
+            p.timer = nil
+            finish_start(p, nil, "timedout")
+        end)
+    pending_start = p
+
+    -- 由 R.OnRspSettlementInfoConfirm、登录链路失败或超时完成 resume
+    return service.yield_session()
+end
+
+function S.stop()
+    if pending_start then
+        finish_start(pending_start, nil, "stopped")
+    else
+        stop_trader()
+    end
+    return true
+end
+
+function S.status()
+    local session = status.session
+    return {
+        state = status.state,
+        since = status.since,
+        connection = trader:state(), -- libctpc 的连接状态
+        reconnects = status.reconnects,
+        last_error = status.last_error,
+        front_id = session and session.FrontID,
+        session_id = session and session.SessionID,
+        trading_day = session and session.TradingDay,
+    }
+end
 
 --
 -- query interfaces
@@ -568,22 +768,15 @@ function R.OnRspOrderAction(rsp) order:update(rsp) end
 
 -- Handle Error
 function R.OnRspError(rsp)
-    if rsp and rsp.rsp_info then 
-        rsp.rsp_info.ErrorMsg  = cv:convert(rsp.rsp_info.ErrorMsg) or ""
+    local err = rsp_error(rsp)
+    if rsp.rsp_info then
+        rsp.rsp_info.ErrorMsg = cv and cv:convert(rsp.rsp_info.ErrorMsg) or rsp.rsp_info.ErrorMsg
     end
     service.log.debug("R.OnRspError: %s", inspect(rsp))
-    -- service.log.debug("Current Request: %s", inspect(query:first()))
-
+    if pending_start and err then
+        pending_start.last_error = err
+    end
     query:update(rsp)
-
-    --[[
-    service.log.debug("R.OnRspError : %d | ErrorID %d | ErrorMsg: %s", 
-        (rsp and rsp.req_id or 0), 
-        (rsp and rsp.rsp_info.ErrorID or 0),
-        (cv:convert(rsp.rsp_info.ErrorMsg) or "")
-    )
-        ]]
-
 end
 
 -- 这只在报单异常时才会出现
@@ -603,7 +796,7 @@ end
 function S.quit()
     service.log.debug("trader is quitting")
     if trader then 
-        trader:stop()
+        S.stop()
         trader = nil
     end
     service.quit()
@@ -618,7 +811,10 @@ function service.on_idle()
         if rsp then 
             -- process trader messages
             local handler = R[rsp.func_name] or function (rsp) query:update(rsp) end 
-            handler( rsp )
+            local ok, err = pcall(handler, rsp)
+            if not ok then
+                service.log.error("trader | handling %s failed: %s", rsp.func_name, err)
+            end
         else 
             -- exit idle status when there is no remaing messages
             return 

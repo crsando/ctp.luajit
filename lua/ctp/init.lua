@@ -328,10 +328,20 @@ function M.new_trader(server)
     }, Trader)
 end
 
-function Trader:start(wait)
-    C.ctp_trader_start(self.trader)
-    if wait then
-        C.ctp_trader_wait_for_settle(self.trader)
+local trader_states = {
+    [C.CTPC_TRADER_DISCONNECTED] = "disconnected",
+    [C.CTPC_TRADER_CONNECTED] = "connected",
+    [C.CTPC_TRADER_AUTHENTICATED] = "authenticated",
+    [C.CTPC_TRADER_LOGGED_IN] = "logged_in",
+    [C.CTPC_TRADER_READY] = "ready",
+}
+
+-- Create the API and start connecting; the login chain's outcome arrives
+-- later as messages (see ctp_trader_start in ctpc.h). Returns self, or nil
+-- and an error when the API could not be created (see the log).
+function Trader:start()
+    if C.ctp_trader_start(self.trader) ~= 1 then
+        return nil, "ctp_trader_start failed"
     end
     return self
 end
@@ -346,8 +356,13 @@ function Trader:async(async)
     return self
 end
 
+-- "disconnected", "connected", "authenticated", "logged_in" or "ready"
+function Trader:state()
+    return trader_states[tonumber(self.trader.state)]
+end
+
 function Trader:is_ready()
-    return (self.trader.connected >= 4)
+    return self.trader.state == C.CTPC_TRADER_READY
 end
 
 -- The struct for CThostFtdcTraderApi::Req<name>, filled from fields.

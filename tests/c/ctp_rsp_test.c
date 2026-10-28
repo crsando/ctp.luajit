@@ -1,8 +1,7 @@
 // ctp_rsp_new / ctp_rsp_free / ctp_trader_drain. Built with ASan + UBSan, so
 // an overflow or a leaked block fails the run as well as a failed CHECK.
 #include "ctpc.h"
-#include "cond.h"
-#include "queue.h"
+#include "msgq.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -99,9 +98,7 @@ test_drain(void) {
     CHECK(ctp_trader_recv(t, false) == NULL, "queue not empty after drain");
     CHECK(ctp_trader_drain(t) == 0, "second drain");
 
-    queue_delete(t->q);
-    cond_release(t->c);
-    free(t->c);
+    msgq_delete(t->mq);
     free(t);
 }
 

@@ -1,8 +1,8 @@
 # ctp_rsp_t 的生命周期
 
 `ctp_rsp_t` 是从 CTP 回调线程传给 Lua 的消息，交易侧（trader）和行情侧（md）都用它。
-两侧的分配和释放相同，只是队列不同：交易侧是固定容量的环形队列（`src/queue.c`），
-行情侧是不限容量的链表（`src/msgq.c`，见第 2 节末尾）。
+两侧的分配、队列（`src/msgq.c` 链表）和释放都相同，区别只在于行情侧的 tick 有积压上限，
+交易侧的消息永不丢弃（见第 2 节）。
 
 ## 一句话
 
@@ -57,19 +57,19 @@ CTP 的回调在 SDK 自己的线程里执行，回调参数只在回调期间�
 | `OnRspError` | 请求的 req_id | 无 | 有则复制 |
 | `OnFrontDisconnected` | `-1`，`is_last = true` | 无 | 无 |
 
-`OnFrontConnected`、`OnRspAuthenticate`、`OnRspUserLogin`、`OnRspUserPasswordUpdate`、
-`OnHeartBeatWarning` 不产生消息，只更新 `connected` 或写日志。
+登录链路同样产生消息，并更新 `state`：`OnFrontConnected`、`OnRspAuthenticate`、
+`OnRspUserLogin`、`OnRspSettlementInfoConfirm`；链路中的请求发不出时，libctpc 补发一条该步骤的
+失败消息（负错误码）。`OnFrontDisconnected` 的原因码在 `rsp_info.ErrorID`。
+`OnRspUserPasswordUpdate`、`OnHeartBeatWarning` 不产生消息，只写日志。
 
 分配失败时 `send_rsp` 记一条 `error` 日志并丢弃这条回调，不会崩溃。
 
 ## 2. 入队：`ctp_trader_send`
 
-`ctp_trader_send`（`src/trader.c`）在 `cond` 的锁内把指针放进队列，通知可能阻塞在
+`ctp_trader_send`（`src/trader.c`）在 `msgq` 的锁内把消息挂到链表尾部，通知可能阻塞在
 `recv` 上的线程，然后在锁外调用 `uv_async_send` 唤醒该 service 的 libuv 循环。
-入队成功后，所有权交给队列，回调线程不再碰这条消息。
-
-> ⚠️ **交易侧的当前缺陷（第三轮修复）**：队列容量固定 1024，满时 `queue_push_ptr` 返回
-> 失败但没有人检查，这条消息既没进队列也没被释放——**被静默丢弃并泄漏**。
+入队成功后，所有权交给队列，回调线程不再碰这条消息。交易侧的消息都是 `CTPC_RSP_EVENT`，
+链表没有容量上限，**交易回报永不丢弃**。
 
 ### 行情侧：`ctp_md_send`
 
@@ -104,10 +104,8 @@ CTP 的回调在 SDK 自己的线程里执行，回调参数只在回调期间�
 
 | 出口 | 位置 | 说明 |
 | --- | --- | --- |
-| 启动时丢弃 | `ctp_trader_wait_for_settle`（`trader:start(true)`） | 阻塞等到结算确认完成，期间收到的消息逐条取出并释放 |
 | 停止时清空 | `ctp_trader_stop` → `ctp_trader_drain` | `Release()` 返回后不再有回调，队列里剩余的都属于刚结束的会话，全部释放 |
 | 原始接口 | `trader:recv_raw()` | 直接返回 `ctp_rsp_t *`，**由调用方负责 `ctp_rsp_free`**；目前没有代码使用 |
-| 队列满 | `ctp_trader_send` | 见上面的缺陷：丢弃并泄漏 |
 | tick 积压 | `ctp_md_send` | 超过 `CTPC_MD_TICK_LIMIT` 的 tick 立即释放并计数；事件不受影响 |
 | 行情停止时清空 | `ctp_md_stop` → `ctp_md_drain` | 同交易侧 |
 | 进程退出 | — | 队列中尚未取出的消息不释放，由操作系统回收 |

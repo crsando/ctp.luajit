@@ -24,7 +24,7 @@ CTP 交易接口的每个 `ReqXxx` 都有一个由 `tools/gen.lua` 生成的 C �
 
 ```lua
 local ctp = require "ctp"
-local trader = ctp.new_trader(server):start(true)
+local trader = ctp.new_trader(server)   -- 通常经 ctp.templates.trader 使用，见下文
 
 local req_id, err = trader:req("QryInvestorPosition", { InstrumentID = "rb2601" })
 -- 回报是 OnRspQryInvestorPosition，req_id 相同
@@ -57,7 +57,20 @@ service.call("collector", "status")  -- state / reconnects / last_error / ticks_
 
 ## 交易
 
-`ctp.templates.trader` 在此之上提供按 1 次/秒流控的查询队列（`S.query_account` 等）
+`ctp.templates.trader` 是交易 service 模板：
+
+```lua
+local ok, err = service.call("trader", "start", { timeout = 10000 }) -- 认证、登录、结算确认
+service.call("trader", "status")  -- state / front_id / session_id / trading_day / reconnects / last_error
+```
+
+- `start` 成功返回 `true`；认证、登录、结算确认任一步失败或超时，返回 `nil, err` 并已自动 stop。
+  超时的原因（例如 SDK 与前置不匹配导致的握手失败 4040）记在 `status().last_error`。
+- 启动成功后的断线由 CTP 自动重连、libctpc 自动重走登录链路；断线时正在执行的查询立即以
+  `"disconnected"` 失败，排队中的查询等重新就绪后再发。未启动时查询立即返回 `"not started"`。
+- 用真实前置检查（只查询、不下单）：`luajit examples/trader_smoke.lua <profile>`。
+
+模板在此之上提供按 1 次/秒流控的查询队列（`S.query_account` 等）
 和订单簿。
 
 ---

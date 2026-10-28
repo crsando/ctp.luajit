@@ -1,9 +1,7 @@
 #include <iostream>
-#include <time.h>
-#include <thread>
-#include <chrono>
+#include <stdio.h>
+#include <stdlib.h>
 #include "string.h"
-#include "malloc.h"
 #include "CustomTradeSpi.h"
 
 extern "C" {
@@ -23,11 +21,44 @@ static void send_rsp(ctp_trader_t * t, const char * fn, const char * field_name,
 	ctp_trader_send(t, rsp);
 }
 
+#define ON_RSP_THEN_SEND_FIELD(fn, tp, field) \
+	send_rsp(this->_trader, #fn, #tp, nRequestID, bIsLast, field, sizeof(tp), pRspInfo)
+
+static void set_state(ctp_trader_t * t, int state)
+{
+	__atomic_store_n(&t->state, state, __ATOMIC_RELEASE);
+}
+
+// A login-chain step that failed without a CTP response: report it as that
+// step's response, with a negative code, so Lua learns why it stopped.
+static void send_error(ctp_trader_t * t, const char * fn, int error_id, const char * msg)
+{
+	CThostFtdcRspInfoField info;
+	memset(&info, 0, sizeof(info));
+	info.ErrorID = error_id;
+	snprintf(info.ErrorMsg, sizeof(info.ErrorMsg), "%s", msg);
+	send_rsp(t, fn, "", -1, true, NULL, 0, &info);
+}
+
+// rc is the result of the request whose response is fn; < 0 means it was not
+// sent and no response will come.
+static void check_sent(ctp_trader_t * t, const char * fn, const char * req, int rc)
+{
+	if (rc > 0)
+		return;
+	char msg[64];
+	snprintf(msg, sizeof(msg), "%s failed (%d)", req, rc);
+	log_error("%s | %s", fn, msg);
+	send_error(t, fn, rc < 0 ? rc : -1, msg);
+}
+
+// 连接成功：开始登录链路（认证 → 登录 → 结算确认），重连后也一样
 void CustomTradeSpi::OnFrontConnected()
 {
 	log_debug("OnFrontConnected | FrontAddr:%s", this->_trader->front_addr);
-	this->_trader->connected = 1;
-	this->reqAuthenticate();
+	set_state(this->_trader, CTPC_TRADER_CONNECTED);
+	send_rsp(this->_trader, "OnFrontConnected", "", -1, true, NULL, 0, NULL);
+	check_sent(this->_trader, "OnRspAuthenticate", "ReqAuthenticate", this->reqAuthenticate());
 }
 
 int CustomTradeSpi::reqAuthenticate() {
@@ -42,13 +73,16 @@ int CustomTradeSpi::reqAuthenticate() {
 
 void CustomTradeSpi::OnRspAuthenticate(CThostFtdcRspAuthenticateField *pRspAuthenticateField, CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
 {
-	if (!isErrorRspInfo(pRspInfo)) {
+	bool ok = !isErrorRspInfo(pRspInfo);
+	if (ok) {
 		log_debug("OnRspAuthenticate | Success | AppID:%s", this->_trader->app_id);
-		this->_trader->connected = 2;
-		reqUserLogin();
+		set_state(this->_trader, CTPC_TRADER_AUTHENTICATED);
 	}
 	else
 		log_error("OnRspAuthenticate | Fail | AppID:%s | %d | %s", this->_trader->app_id, pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+	ON_RSP_THEN_SEND_FIELD(OnRspAuthenticate, CThostFtdcRspAuthenticateField, pRspAuthenticateField);
+	if (ok)
+		check_sent(this->_trader, "OnRspUserLogin", "ReqUserLogin", reqUserLogin());
 }
 
 void CustomTradeSpi::OnRspUserLogin(
@@ -57,25 +91,27 @@ void CustomTradeSpi::OnRspUserLogin(
 	int nRequestID,
 	bool bIsLast)
 {
-	if (!isErrorRspInfo(pRspInfo))
+	bool ok = !isErrorRspInfo(pRspInfo) && pRspUserLogin != NULL;
+	if (ok)
 	{
-		this->_trader->connected = 3;
 		log_debug("OnRspUserLogin | Success | BrokerID:%s | UserID:%s", pRspUserLogin->BrokerID, pRspUserLogin->UserID);
 		log_debug("OnRspUserLogin | FrontID: %d | SessionID: %d | MaxOrderRef: %s",
 			pRspUserLogin->FrontID, pRspUserLogin->SessionID, pRspUserLogin->MaxOrderRef);
-
 
 		// session info
 		this->_trader->front_id = pRspUserLogin->FrontID;
 		this->_trader->session_id = pRspUserLogin->SessionID;
 		strcpy(this->_trader->max_order_ref, pRspUserLogin->MaxOrderRef);
 		strcpy(this->_trader->lst_order_ref, pRspUserLogin->MaxOrderRef);
-
-		// 投资者结算结果确认
-		reqSettlementInfoConfirm();
+		set_state(this->_trader, CTPC_TRADER_LOGGED_IN);
 	}
-	else
+	else if (pRspInfo != NULL)
 		log_error("OnRspUserLogin | Fail | BrokerID:%s | UserID:%s | %d | %s", this->_trader->broker, this->_trader->user, pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+	ON_RSP_THEN_SEND_FIELD(OnRspUserLogin, CThostFtdcRspUserLoginField, pRspUserLogin);
+
+	// 投资者结算结果确认
+	if (ok)
+		check_sent(this->_trader, "OnRspSettlementInfoConfirm", "ReqSettlementInfoConfirm", reqSettlementInfoConfirm());
 }
 
 void CustomTradeSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
@@ -85,11 +121,23 @@ void CustomTradeSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID
 	send_rsp(this->_trader, "OnRspError", "", nRequestID, bIsLast, NULL, 0, pRspInfo);
 }
 
+// 断开连接：CTP 会自动重连，之后再走 OnFrontConnected
 void CustomTradeSpi::OnFrontDisconnected(int nReason)
 {
-	log_warn("OnFrontDisconnected | FrontAddr:%s | nReason:%d", this->_trader->front_addr, nReason);
-	this->_trader->connected = 0;
-	send_rsp(this->_trader, "OnFrontDisconnected", "", -1, true, NULL, 0, NULL);
+	const char * reason;
+	switch (nReason) {
+	case 0x1001: reason = "network read failed"; break;
+	case 0x1002: reason = "network write failed"; break;
+	case 0x2001: reason = "heartbeat timeout"; break;
+	case 0x2002: reason = "heartbeat send failed"; break;
+	case 0x2003: reason = "bad packet received"; break;
+	default: reason = "unknown reason"; break;
+	}
+	char msg[64];
+	snprintf(msg, sizeof(msg), "disconnected: %s (0x%x)", reason, nReason);
+	log_warn("OnFrontDisconnected | FrontAddr:%s | %s", this->_trader->front_addr, msg);
+	set_state(this->_trader, CTPC_TRADER_DISCONNECTED);
+	send_error(this->_trader, "OnFrontDisconnected", nReason, msg);
 }
 
 void CustomTradeSpi::OnHeartBeatWarning(int nTimeLapse)
@@ -99,8 +147,7 @@ void CustomTradeSpi::OnHeartBeatWarning(int nTimeLapse)
 
 
 
-#define ON_RSP_THEN_SEND(fn ,tp) \
-	send_rsp(this->_trader, #fn, #tp, nRequestID, bIsLast, pField, sizeof(tp), pRspInfo)
+#define ON_RSP_THEN_SEND(fn ,tp) ON_RSP_THEN_SEND_FIELD(fn, tp, pField)
 
 // this macro is used for Order/Trade Response
 #define ON_RSP_THEN_SEND_COMPACT(fn, tp) \
@@ -128,8 +175,9 @@ void CustomTradeSpi::OnRspSettlementInfoConfirm(
 	bool bIsLast)
 {
 	if (!isErrorRspInfo(pRspInfo)) {
-		this->_trader->connected = 4;
-		log_debug("OnRspSettlementInfoConfirm | Success | ConfirmDate:%s %s", pField->ConfirmDate, pField->ConfirmTime);
+		set_state(this->_trader, CTPC_TRADER_READY);
+		log_debug("OnRspSettlementInfoConfirm | Success | ConfirmDate:%s %s",
+			pField ? pField->ConfirmDate : "", pField ? pField->ConfirmTime : "");
 	}
 	else {
 		log_error("OnRspSettlementInfoConfirm | Failed | %d | %s", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
@@ -158,8 +206,12 @@ void CustomTradeSpi::OnRtnOrder(CThostFtdcOrderField *pField)
 {
     char submit_status[128];
     char order_status[128];
-	// FrontID + SessionID + OrderRef
-	strcpy(this->_trader->lst_order_ref, pField->OrderRef);
+	// FrontID + SessionID + OrderRef. Only this session's orders move the last
+	// order ref, and only forward: the private stream replays earlier
+	// sessions' orders on (re)connect, whose refs must not be reused.
+	if (pField->FrontID == this->_trader->front_id && pField->SessionID == this->_trader->session_id
+		&& atoi(pField->OrderRef) > atoi(this->_trader->lst_order_ref))
+		strcpy(this->_trader->lst_order_ref, pField->OrderRef);
 
     switch (pField->OrderSubmitStatus) {
     case THOST_FTDC_OSS_InsertSubmitted:
@@ -273,9 +325,8 @@ void CustomTradeSpi::OnRspUserLogout(
 	{
 		log_debug("OnRspUserLogout | Success | BrokerID:%s | UserID:%s", this->_trader->broker, this->_trader->user);
 
-        if(this->_trader->connected >= 2) {
-            this->_trader->connected = 1; // connected, not logined
-        }
+        if (this->_trader->state >= CTPC_TRADER_AUTHENTICATED)
+            set_state(this->_trader, CTPC_TRADER_CONNECTED); // connected, not logged in
 	}
 
     ON_RSP_THEN_SEND(OnRspUserLogout, CThostFtdcUserLogoutField);
