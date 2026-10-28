@@ -72,6 +72,17 @@ static int ctp_flow_path(char * out, size_t n, const char * root, const char * b
     return 0;
 }
 
+// RegisterFront crashes inside the SDK on an address without "protocol://"
+// (e.g. "1.2.3.4:5" instead of "tcp://1.2.3.4:5"), so refuse those here.
+static int ctp_front_addr_ok(const char * addr) {
+    const char * p = strstr(addr, "://");
+    if (p == NULL || p == addr || p[3] == '\0') {
+        log_error("front address %s is not protocol://host:port, e.g. tcp://host:port", addr);
+        return 0;
+    }
+    return 1;
+}
+
 // MD API
 #define _api(md) ((CThostFtdcMdApi *)((md)->_api))
 #define _spi(md) ((CustomMdSpi *)((md)->_spi))
@@ -81,6 +92,8 @@ int ctp_md_start(ctp_md_t * md) {
         log_debug("api/spi already initialized, abort ctp_md_start");
         return 0;
     }
+    if (!ctp_front_addr_ok(md->front_addr))
+        return 0;
 
     char flow[256];
     if (ctp_flow_path(flow, sizeof(flow), "ctp_md", md->broker, md->user) != 0) {
@@ -90,18 +103,24 @@ int ctp_md_start(ctp_md_t * md) {
 
     log_debug("ctp_md_start | init Spi/Api | flow path %s", flow);
 
-	CustomMdSpi * pMdUserSpi = new CustomMdSpi();       // 创建行情回调实例
-
-    // 我们需要保存这个member变量，这个变量在Login的过程中有用到
 	ctp_stdio_init();
-	pMdUserSpi->g_pMdUserApi = CThostFtdcMdApi::CreateFtdcMdApi(flow);   // 创建行情实例
+	CThostFtdcMdApi * pMdUserApi = CThostFtdcMdApi::CreateFtdcMdApi(flow);   // 创建行情实例
+	if (pMdUserApi == NULL) {
+		log_error("ctp_md_start | CreateFtdcMdApi failed");
+		return 0;
+	}
+
+	CustomMdSpi * pMdUserSpi = new CustomMdSpi();       // 创建行情回调实例
+	// 我们需要保存这个member变量，这个变量在Login的过程中有用到
+	pMdUserSpi->g_pMdUserApi = pMdUserApi;
+	pMdUserSpi->_md = md;
+	md->state = CTPC_MD_DISCONNECTED;
 	pMdUserSpi->g_pMdUserApi->RegisterSpi(pMdUserSpi);               // 注册事件类
 	pMdUserSpi->g_pMdUserApi->RegisterFront(md->front_addr);           // 设置行情前置地址
 	
 	md->_spi = (void *)pMdUserSpi;
 	md->_api = (void *)(pMdUserSpi->g_pMdUserApi);
 
-	_spi(md)->_md = md;
 	_api(md)->Init();
 
     return 1;
@@ -121,8 +140,13 @@ int ctp_md_stop(ctp_md_t * md) {
         md->_spi = NULL;
     }
 
-    // Update Connected Status
-    md->connected = 0;
+    // Release() has returned, so no callback can queue anything more; what is
+    // left belongs to the session that just ended.
+    int dropped = ctp_md_drain(md);
+    if (dropped > 0)
+        log_debug("ctp_md_stop | dropped %d pending messages", dropped);
+
+    md->state = CTPC_MD_DISCONNECTED;
 
     return 1;
 }
@@ -141,15 +165,19 @@ ctp_md_t * ctp_md_init(ctp_md_t * md, const char front_addr[], const char broker
     md->_api = NULL;
     md->_spi = NULL;
 
-	md->connected = 0;
+	md->state = CTPC_MD_DISCONNECTED;
 
 	return md;
 }
 
 int ctp_md_subscribe(ctp_md_t * md, char * symbols [], int num) {
+    if (_api(md) == NULL)
+        return CTPC_E_NOT_STARTED;
     return _api(md)->SubscribeMarketData(symbols, num);
 }
 int ctp_md_unsubscribe(ctp_md_t * md, char * symbols [], int num) {
+    if (_api(md) == NULL)
+        return CTPC_E_NOT_STARTED;
     return _api(md)->UnSubscribeMarketData(symbols, num);
 }
 
@@ -188,6 +216,8 @@ int ctp_trader_start(ctp_trader_t * trader) {
         log_debug("ctp_trader_start: already initialized");
         return 0;
     }
+    if (!ctp_front_addr_ok(trader->front_addr))
+        return 0;
 
     trader->connected = 0;
 

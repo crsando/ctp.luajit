@@ -60,6 +60,11 @@ do
     end, "broker is longer than 10 bytes", "oversized broker")
     t.raises(function () ctp.new_collector { front_addr = "tcp://127.0.0.1:1", broker = "9999" } end,
         "user must be a string", "collector without user")
+    -- the SDK crashes on these
+    t.raises(function () ctp.new_collector { front_addr = "127.0.0.1:1", broker = "9999", user = "u" } end,
+        "must look like tcp://host:port", "collector front without protocol")
+    t.raises(function () ctp.new_trader { front_addr = "127.0.0.1:1", broker = "9999", user = "u", pass = "p" } end,
+        "must look like tcp://host:port", "trader front without protocol")
 end
 
 -- requests: before start every request fails at once, without a request id

@@ -186,8 +186,9 @@ SDK_SLOTS = $$(readelf -rW $(1) | awk '$$3 ~ /GLOB_DAT|JUMP_SLOT|R_X86_64_64/ &&
 
 test: test-c test-gen test-lua
 
-test-c: $(TEST_DIR)/ctp_rsp_test $(TEST_DIR)/ctp_stdio_test $(TEST_DIR)/libfakectp_norelro.so $(TEST_DIR)/libfakectp_relro.so
+test-c: $(TEST_DIR)/ctp_rsp_test $(TEST_DIR)/msgq_test $(TEST_DIR)/ctp_stdio_test $(TEST_DIR)/libfakectp_norelro.so $(TEST_DIR)/libfakectp_relro.so
 	$(TEST_ENV) UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 $(TEST_DIR)/ctp_rsp_test
+	$(TEST_ENV) UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 $(TEST_DIR)/msgq_test
 	@set -e; for lib in norelro relro; do for bind in lazy now; do \
 		$(TEST_ENV) $(TEST_DIR)/ctp_stdio_test $(TEST_DIR)/libfakectp_$$lib.so $$bind; \
 	done; done
@@ -210,9 +211,14 @@ test-gen: $(TARGET)
 test-lua: all
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/ctp_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_query_test.lua
+	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/collector_test.lua
 
 # ASan/UBSan: overflows and leaked blocks fail the test too.
 $(TEST_DIR)/ctp_rsp_test: tests/c/ctp_rsp_test.c $(SRC_DIR)/trader.c $(SRC_DIR)/queue.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)
+	$(CC) $(ALL_CPPFLAGS) -std=gnu11 $(WARN_FLAGS) -O1 -g -fno-omit-frame-pointer \
+		-fsanitize=address,undefined -o $@ $(filter %.c,$^) -luv -lpthread
+
+$(TEST_DIR)/msgq_test: tests/c/msgq_test.c $(SRC_DIR)/msgq.c $(SRC_DIR)/md.c $(SRC_DIR)/trader.c $(SRC_DIR)/queue.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)
 	$(CC) $(ALL_CPPFLAGS) -std=gnu11 $(WARN_FLAGS) -O1 -g -fno-omit-frame-pointer \
 		-fsanitize=address,undefined -o $@ $(filter %.c,$^) -luv -lpthread
 

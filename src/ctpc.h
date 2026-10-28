@@ -7,40 +7,89 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// A message from a CTP callback thread to Lua: one callback's arguments,
+// copied into one allocation. Lifecycle and ownership: docs/ctp_rsp.md.
+enum {
+    CTPC_RSP_EVENT = 0, // responses and state changes: never dropped
+    CTPC_RSP_TICK = 1,  // market data: dropped when too many are queued
+};
+
+typedef struct {
+    // header
+    uint32_t rsp_typ; // CTPC_RSP_*
+    char desc[256];
+    char func_name[256];
+    char field_name[256];
+
+    // main body
+    int req_id;
+    void * field;
+    size_t size;
+    int last;
+    bool is_last;
+
+    // common
+    void * rsp_info;
+
+    void * _next; // link in the market data queue (src/msgq.c)
+} ctp_rsp_t;
+
+// Market data connection state, ctp_md_t.state. Written by the SPI thread;
+// every change is also queued as a message (see ctp_md_recv).
+enum {
+    CTPC_MD_DISCONNECTED = 0, // not started, or connection lost (CTP reconnects)
+    CTPC_MD_CONNECTED = 1,    // connected, logging in
+    CTPC_MD_LOGGED_IN = 2,    // ready for subscriptions
+};
+
 typedef struct {
     // tcp://xxx.xxx.xxx.xxx:xxxx
     char front_addr[128]; // FrontAddr
     char broker[11]; // BrokerID
     char user[13]; // InvestorID
 
-    // status
-    int connected; // 0: not connected; 1: connected; 2: logined
+    int state; // CTPC_MD_*
 
     void * _spi;
     void * _api;
 
-    // internal message queue for tick data
-    struct queue * q;
-    struct cond * c;
+    struct msgq * mq; // messages for Lua: events and ticks, in arrival order
 
     void * async; // libuv async handler
 } ctp_md_t;
 
+// At most this many ticks wait in the queue; newer ticks are dropped and
+// counted. Events are always queued.
+#define CTPC_MD_TICK_LIMIT 100000
 
 // Applicaton Interface
 ctp_md_t * ctp_md_new();
 ctp_md_t * ctp_md_init(ctp_md_t * md, const char front_addr[], const char broker[], const char user[]);
 
+// 0 when sent; CTP's error code, or CTPC_E_NOT_STARTED before ctp_md_start.
 int ctp_md_subscribe(ctp_md_t * md, char * symbols[], int num);
 int ctp_md_unsubscribe(ctp_md_t * md, char * symbols[], int num);
 
+// 1 when the API is created and connecting, 0 on failure (logged) or when
+// already started. The outcome of connecting and logging in arrives as
+// OnFrontConnected / OnRspUserLogin messages.
 int ctp_md_start(ctp_md_t * md);
+// Release the API and free every queued message.
 int ctp_md_stop(ctp_md_t * md);
 
-typedef struct CThostFtdcDepthMarketDataField ctp_md_tick_t;
-void ctp_md_send(ctp_md_t * md, void *msg);
-ctp_md_tick_t * ctp_md_recv(ctp_md_t * md, bool blocking);
-void ctp_md_tick_free(ctp_md_tick_t * t);
+// Messages, in arrival order:
+//   OnFrontConnected      no field
+//   OnRspUserLogin        CThostFtdcRspUserLoginField; rsp_info.ErrorID != 0 on
+//                         failure, negative when ReqUserLogin could not be sent
+//   OnFrontDisconnected   rsp_info.ErrorID is CTP's reason code
+//   OnRspSubMarketData / OnRspUnSubMarketData / OnRspError
+//   OnRtnDepthMarketData  CThostFtdcDepthMarketDataField, rsp_typ CTPC_RSP_TICK
+void ctp_md_send(ctp_md_t * md, ctp_rsp_t * msg);
+ctp_rsp_t * ctp_md_recv(ctp_md_t * md, bool blocking);
+// Free every message still queued; returns how many were freed.
+int ctp_md_drain(ctp_md_t * md);
+// Ticks dropped because CTPC_MD_TICK_LIMIT were already queued.
+long long ctp_md_ticks_dropped(ctp_md_t * md);
 
 
 // declarations
@@ -85,25 +134,6 @@ ctp_trader_t * ctp_trader_init(ctp_trader_t * trader, const char front_addr[], c
 int ctp_trader_start(ctp_trader_t * trader);
 int ctp_trader_stop(ctp_trader_t * trader);
 
-typedef struct {
-    // header
-    uint32_t rsp_typ;
-    char desc[256];
-    char func_name[256];
-    char field_name[256];
-
-    // main body
-    int req_id;
-    void * field;
-    size_t size;
-    int last;
-    bool is_last;
-
-    // common
-    void * rsp_info;
-} ctp_rsp_t;
-
-// Lifecycle and ownership: docs/ctp_rsp.md.
 // Build a message in one allocation: field and rsp_info are copied right after
 // the header, so ctp_rsp_free releases all of it. field / rsp_info may be NULL.
 // Returns NULL when out of memory.

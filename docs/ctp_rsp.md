@@ -1,7 +1,8 @@
 # ctp_rsp_t 的生命周期
 
-`ctp_rsp_t` 是交易侧（trader）从 CTP 回调线程传给 Lua 的消息。行情侧（md）的 tick
-走另一条更简单的路径，不在本文范围内。
+`ctp_rsp_t` 是从 CTP 回调线程传给 Lua 的消息，交易侧（trader）和行情侧（md）都用它。
+两侧的分配和释放相同，只是队列不同：交易侧是固定容量的环形队列（`src/queue.c`），
+行情侧是不限容量的链表（`src/msgq.c`，见第 2 节末尾）。
 
 ## 一句话
 
@@ -15,7 +16,7 @@
    └ send_rsp
        └ ctp_rsp_new   ── 分配 ──┐
    └ ctp_trader_send   ── 入队 ──┼──> [ ctp_rsp_t * ... ] ──> ctp_trader_recv  ── 出队
-       └ uv_async_send ── 唤醒 ──┘                              └ cast_trader_rsp ── 复制成 Lua table
+       └ uv_async_send ── 唤醒 ──┘                              └ cast_rsp        ── 复制成 Lua table
                                                                └ ctp_rsp_free    ── 释放
                                                                └ R[func_name] / query:update(table)
 ```
@@ -67,8 +68,21 @@ CTP 的回调在 SDK 自己的线程里执行，回调参数只在回调期间�
 `recv` 上的线程，然后在锁外调用 `uv_async_send` 唤醒该 service 的 libuv 循环。
 入队成功后，所有权交给队列，回调线程不再碰这条消息。
 
-> ⚠️ **当前缺陷（架构评估 #8，待修）**：队列容量固定 1024，满时 `queue_push_ptr` 返回
+> ⚠️ **交易侧的当前缺陷（第三轮修复）**：队列容量固定 1024，满时 `queue_push_ptr` 返回
 > 失败但没有人检查，这条消息既没进队列也没被释放——**被静默丢弃并泄漏**。
+
+### 行情侧：`ctp_md_send`
+
+`ctp_md_send`（`src/md.c`）把消息挂到 `msgq` 链表尾部（经 `ctp_rsp_t._next` 链接），
+同样在锁外 `uv_async_send`。`rsp_typ` 区分两类消息：
+
+- `CTPC_RSP_EVENT`（登录、断线、订阅回报等）：**总是入队**，链表没有容量上限；
+- `CTPC_RSP_TICK`（`OnRtnDepthMarketData`）：已有 `CTPC_MD_TICK_LIMIT` 条 tick 排队时，
+  新 tick 被拒绝，`ctp_md_send` 立即 `ctp_rsp_free` 并计数（`ctp_md_ticks_dropped`），
+  第 1 次及每 10000 次记一条 `warn`。
+
+事件和 tick 在同一个队列里，Lua 看到的先后顺序与回调顺序一致，例如重连后的登录事件
+一定排在之后的 tick 之前。
 
 ## 3. 出队与释放：Lua 线程
 
@@ -76,12 +90,15 @@ CTP 的回调在 SDK 自己的线程里执行，回调参数只在回调期间�
 `service.on_idle` 循环调用，直到队列为空：
 
 1. `ctp_trader_recv` 在锁内取出指针，所有权转给调用方；
-2. `cast_trader_rsp` 把 `field` / `rsp_info` 按头文件元数据**逐字段复制**成 Lua table，
+2. `cast_rsp` 把 `field` / `rsp_info` 按头文件元数据**逐字段复制**成 Lua table，
    字符串用 `ffi.string` 复制；
 3. 立即 `ctp_rsp_free`。此后 Lua 拿到的只是普通 table，不再引用 C 内存；
 4. 模板按 `func_name` 分发：`R.OnRtnOrder` 等进入订单簿，其余进入 `query:update`。
 
 所以一条消息在 Lua 线程上从出队到释放只跨越 `recv` 这一个函数调用。
+
+行情侧相同：`collector:recv(false)` → `ctp_md_recv` → 转成 table → `ctp_rsp_free`，
+模板 `ctp.templates.collector` 按 `func_name` 分发事件和 tick。
 
 ## 4. 其他出口
 
@@ -91,10 +108,13 @@ CTP 的回调在 SDK 自己的线程里执行，回调参数只在回调期间�
 | 停止时清空 | `ctp_trader_stop` → `ctp_trader_drain` | `Release()` 返回后不再有回调，队列里剩余的都属于刚结束的会话，全部释放 |
 | 原始接口 | `trader:recv_raw()` | 直接返回 `ctp_rsp_t *`，**由调用方负责 `ctp_rsp_free`**；目前没有代码使用 |
 | 队列满 | `ctp_trader_send` | 见上面的缺陷：丢弃并泄漏 |
+| tick 积压 | `ctp_md_send` | 超过 `CTPC_MD_TICK_LIMIT` 的 tick 立即释放并计数；事件不受影响 |
+| 行情停止时清空 | `ctp_md_stop` → `ctp_md_drain` | 同交易侧 |
 | 进程退出 | — | 队列中尚未取出的消息不释放，由操作系统回收 |
 
 ## 测试
 
 `tests/c/ctp_rsp_test.c`（`make test`，以 ASan + UBSan + LeakSanitizer 编译）覆盖布局与
-内容、空 `field` / `rsp_info`、名字截断、`ctp_trader_drain`；任何越界或漏释放都会让测试
-失败。
+内容、空 `field` / `rsp_info`、名字截断、`ctp_trader_drain`；`tests/c/msgq_test.c`
+覆盖行情队列的先后顺序、tick 上限与计数、事件不受上限影响、`ctp_md_drain`。任何越界或
+漏释放都会让测试失败。

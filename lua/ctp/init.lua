@@ -165,7 +165,18 @@ local function check_string(s, field, value, label)
     return value
 end
 
-local function cast_trader_rsp(rsp)
+-- The SDK crashes on a front address without "protocol://"; see ctpc.cpp.
+local function check_front_addr(s, value, label)
+    check_string(s, "front_addr", value, label)
+    if not value:match("^%a[%w]*://.") then
+        error(string.format("%s: front_addr %q must look like tcp://host:port", label, value), 3)
+    end
+    return value
+end
+
+-- A ctp_rsp_t as a Lua table: func_name, field_name, req_id, is_last, and
+-- field / rsp_info converted with totable.
+local function cast_rsp(rsp)
     if rsp == nil then return nil end
     local rst = {}
     rst.req_id = tonumber(rsp.req_id)
@@ -219,7 +230,7 @@ function M.new_collector(server)
 
     local md = C.ctp_md_new()
     C.ctp_md_init(md,
-        check_string(md, "front_addr", server.front_addr, "new_collector"),
+        check_front_addr(md, server.front_addr, "new_collector"),
         check_string(md, "broker", server.broker, "new_collector"),
         check_string(md, "user", server.user, "new_collector"))
 
@@ -231,20 +242,36 @@ function Collector:async(async)
     return self
 end
 
+local md_states = {
+    [C.CTPC_MD_DISCONNECTED] = "disconnected",
+    [C.CTPC_MD_CONNECTED] = "connected",
+    [C.CTPC_MD_LOGGED_IN] = "logged_in",
+}
+
+-- Returns 0 when sent, or a non-zero code and its message.
+local function md_result(rc)
+    rc = tonumber(rc)
+    if rc == 0 then return 0 end
+    return rc, rc < 0 and M.strerror(rc) or ("CTP error " .. rc)
+end
+
 function Collector:subscribe(symbols)
     local c_symbols, num, buffers = symbols_table_to_char_pp(symbols)
-    C.ctp_md_subscribe(self.md, c_symbols, num)
-    return self
+    return md_result(C.ctp_md_subscribe(self.md, c_symbols, num))
 end
 
 function Collector:unsubscribe(symbols)
     local c_symbols, num, buffers = symbols_table_to_char_pp(symbols)
-    C.ctp_md_unsubscribe(self.md, c_symbols, num)
-    return self
+    return md_result(C.ctp_md_unsubscribe(self.md, c_symbols, num))
 end
 
+-- Create the API and start connecting; whether that works arrives later as
+-- OnFrontConnected / OnRspUserLogin messages. Returns self, or nil and an
+-- error when the API could not be created (see the log).
 function Collector:start()
-    C.ctp_md_start(self.md)
+    if C.ctp_md_start(self.md) ~= 1 then
+        return nil, "ctp_md_start failed"
+    end
     return self
 end
 
@@ -253,24 +280,26 @@ function Collector:stop()
     return self
 end
 
+-- The next message (see ctp_md_recv in ctpc.h) as a table, or nil.
 function Collector:recv(blocking)
-    local ptr = C.ctp_md_recv(self.md, blocking)
-    local tick_data = nil
+    local rsp = C.ctp_md_recv(self.md, blocking)
+    local t = cast_rsp(rsp)
+    C.ctp_rsp_free(rsp)
+    return t
+end
 
-    if ptr ~= nil then
-        tick_data = totable(ptr, "CThostFtdcDepthMarketDataField")
-        C.ctp_md_tick_free(ptr)
-    end
-
-    return tick_data
+-- "disconnected", "connected" or "logged_in"
+function Collector:state()
+    return md_states[tonumber(self.md.state)]
 end
 
 function Collector:is_ready()
-    return (self.md.connected >= 2)
+    return self.md.state == C.CTPC_MD_LOGGED_IN
 end
 
-function Collector:connected()
-    return self.md.connected
+-- Ticks dropped because Lua did not keep up.
+function Collector:ticks_dropped()
+    return tonumber(C.ctp_md_ticks_dropped(self.md))
 end
 
 --
@@ -285,7 +314,7 @@ function M.new_trader(server)
     assert(server, "new_trader: server config required")
     local trader = C.ctp_trader_new()
     C.ctp_trader_init(trader,
-        check_string(trader, "front_addr", server.front_addr, "new_trader"),
+        check_front_addr(trader, server.front_addr, "new_trader"),
         check_string(trader, "broker", server.broker, "new_trader"),
         check_string(trader, "user", server.user, "new_trader"),
         check_string(trader, "password", server.pass, "new_trader"),
@@ -353,7 +382,7 @@ end
 
 function Trader:recv(blocking)
     local rsp = C.ctp_trader_recv(self.trader, blocking)
-    local t = cast_trader_rsp(rsp)
+    local t = cast_rsp(rsp)
     C.ctp_rsp_free(rsp)
     return t
 end

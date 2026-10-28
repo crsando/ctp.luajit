@@ -2,9 +2,6 @@
 // ---- 派生的行情类 ---- //
 #include "ThostFtdcMdApi.h"
 
-#include <string>
-#include <unordered_set>
-
 extern "C" {
 	#include "ctpc.h"
 }
@@ -64,8 +61,5 @@ public:
 
 	// extended
 	ctp_md_t * _md;
-
-    // 当前订阅集合
-    std::unordered_set<std::string> subscribed;
 };
 

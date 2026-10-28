@@ -36,6 +36,27 @@ local req_id, err = trader:req("QryInvestorPosition", { InstrumentID = "rb2601" 
   （`ctp.strerror`）：`-1` 网络失败、`-2` 未处理请求过多、`-3` 每秒请求过多、
   `-100` trader 未启动。
 
+## 行情
+
+`ctp.templates.collector` 是行情 service 模板：
+
+```lua
+local ok, err = service.call("collector", "start", { timeout = 10000 }) -- 默认 10 秒
+service.call("collector", "subscribe", { "rb2601", "au2612" })          -- 启动前后都可以
+service.call("collector", "status")  -- state / reconnects / last_error / ticks_dropped ...
+```
+
+- `start` 成功返回 `true`；登录被拒、超时或本地初始化失败时返回 `nil, err`，并已自动 stop。
+- 启动成功后的断线由 CTP 自动重连、libctpc 自动重新登录，模板按订阅集合重订阅。
+- 使用者覆盖 `S.on_tick(tick)`；它抛错只会被计数和记日志，不影响后续 tick。
+- 用真实前置检查：`luajit examples/collector_smoke.lua <profile>`。
+- `front_addr` 必须带协议，如 `tcp://host:port`；少了 `tcp://` 时 CTP SDK 会直接崩溃，
+  所以 `new_collector` / `new_trader` 会先报错。
+- openctp 的 TTS 环境（如 `trading.openctp.cn`）需要 openctp 自己的 SDK 库，用官方
+  `ctp-6.7.10` 连接会被反复断开。
+
+## 交易
+
 `ctp.templates.trader` 在此之上提供按 1 次/秒流控的查询队列（`S.query_account` 等）
 和订单簿。
 

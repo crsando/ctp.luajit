@@ -50,7 +50,22 @@ lib/<CTP_VER>/                         CTP SDK
 - `lib/ctp.luajit/<CTP_VER>/` 存放 libctpc.so 和对应 SDK 库，多个 SDK 版本可并存，不往
   `/usr/local/lib` 放任何 `libthost*.so`。Lua 按绝对路径 `ffi.load`，不依赖动态链接器搜索路径。
 
-### 2.4 CTP SDK 输出改道
+### 2.4 行情侧：状态事件化与启动 ✅
+
+- 连接状态是显式的枚举 `ctp_md_t.state`（`CTPC_MD_DISCONNECTED / CONNECTED / LOGGED_IN`），
+  每次变化同时作为消息入队：`OnFrontConnected`、`OnRspUserLogin`（失败时带错误码；
+  `ReqUserLogin` 发不出时 libctpc 自己补一条负错误码的失败）、`OnFrontDisconnected`
+  （原因码在 `rsp_info.ErrorID`）、订阅回报、`OnRspError`。
+- tick 也是 `ctp_rsp_t`，和事件走同一个队列（`msgq`），保证 Lua 看到的顺序与回调一致。
+  事件永不丢；tick 超过 `CTPC_MD_TICK_LIMIT` 才丢并计数。只轮询状态值做不到这一点：
+  几十毫秒内断开又重连，Lua 根本看不到，也就不会重订阅。
+- `S.start{ timeout }` 只有三种结局：登录成功；明确失败（登录被拒、请求发不出、本地初始化
+  失败）；超时。后两种自动 stop，失败即干净。启动成功之后的断线由 CTP 重连、libctpc 重新
+  登录，模板在登录事件里按订阅集合重订阅。
+- 订阅集合由 Lua 维护（C 侧不再保存），启动前、断线期间的 `subscribe` 都只记入集合，登录后统一发送。
+- 前置地址没有 `protocol://` 时 SDK 的 `RegisterFront` 会段错误，Lua 和 C 两层都在调用前拒绝。
+
+### 2.5 CTP SDK 输出改道
 
 见 README 特别提示和 [docs/logging.md](docs/logging.md)。
 
@@ -75,18 +90,19 @@ lib/<CTP_VER>/                         CTP SDK
 | 14 | 改密 | 请求发出即改缓存密码，失败后重连用错密码 | 第二轮：收到成功回报后再改 |
 | 15 | 改密回报 | 不推给 Lua，用 `std::cout` 输出 | 第二轮 |
 | 16 | req_id | 跨线程非原子递增 | ✅ 第一轮：`__atomic_add_fetch` |
-| 17 | 登录 | `start(true)` 无超时；认证/登录/结算失败不推消息，service 线程永久阻塞 | 第二轮：状态迁移作为消息推给 Lua |
+| 17 | 登录 | `start(true)` 无超时；认证/登录/结算失败不推消息，service 线程永久阻塞 | 行情侧 ✅（2.4）；交易侧第二轮，按同样的模式 |
 | — | 只读 | `config.read_only or true` 永远为 true 且从未检查 | 第二轮 |
 | — | `query_order` | 只返回第一条委托 | 第二轮 |
 
 ### C 层健壮性（第三轮）
 
-- 队列满（容量 1023）时静默丢消息并泄漏。交易侧改为无界、永不丢；行情侧有界，丢最旧并计数报警。
-- 行情断线重连后不重新订阅（`subscribed` 集合已在维护）。
-- 行情心跳警告把 `connected` 置 0。
-- 订阅回报中的合约指针可能为 NULL。
-- `ctp_md_stop` 不清空 tick 队列；没有 `ctp_md_free` / `ctp_trader_free`；`ctp_trader_release` 是死代码。
-- `malloc` 返回值未检查（`md.c`、`trader.c`、`CustomMdSpi.cpp`）。
+- 交易侧队列满（容量 1023）时静默丢消息并泄漏：改用 `msgq`，交易回报不设上限。
+  行情侧 ✅（2.4，tick 有上限、事件不丢）。
+- ✅ 行情断线重连后不重新订阅。
+- ✅ 行情心跳警告把状态置为断开。
+- ✅ 订阅回报中的合约指针可能为 NULL。
+- ✅ `ctp_md_stop` 不清空队列。没有 `ctp_md_free` / `ctp_trader_free`；`ctp_trader_release` 是死代码。
+- `malloc` 返回值未检查（`trader.c`；`md.c`、`CustomMdSpi.cpp` ✅）。
 - C 侧 `strcpy` 无长度检查（Lua 入口已在第一轮检查，C 接口本身仍未防护）。
 - `hook_write`：进程关闭 fd 1/2 后，socket 复用该编号时 SDK 的写会被吞进日志。
 - 回报一侧（`CUSTOM_ON` 列表）也改为生成，覆盖全部 `OnRsp*` / `OnRtn*`。
@@ -116,7 +132,10 @@ lib/<CTP_VER>/                         CTP SDK
 
 `make test`：
 
-- `test-c`：`ctp_rsp_t` 布局与释放（ASan/UBSan/LSan）、CTP 输出改道（假 SDK + 真实 SDK）。
+- `test-c`：`ctp_rsp_t` 布局与释放、行情队列 `msgq`（均以 ASan/UBSan/LSan 编译）、
+  CTP 输出改道（假 SDK + 真实 SDK）。
 - `test-gen`：头文件中的 `ReqXxx` 数量与 libctpc.so 导出的包装数量一致（独立于生成器统计）。
 - `test-lua`：绑定层（常量、struct 填充/转换、长度检查、默认字段、未启动时的错误码），
-  以及 trader 模板的查询队列（发送失败立即返回、超时不堵队列、迟到的超时和回报不误唤醒）。
+  trader 模板的查询队列（发送失败立即返回、超时不堵队列、迟到的超时和回报不误唤醒），
+  collector 模板的启动与事件（成功、登录被拒、超时、stop、断线重连后按集合重订阅、tick 出错）。
+- 真实前置：`examples/collector_smoke.lua [profile]`，启动、订阅、收 tick，再验证不可达前置的超时失败。
