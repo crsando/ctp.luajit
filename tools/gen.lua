@@ -1,0 +1,238 @@
+-- Generate the request wrappers and the Lua cdefs from the CTP SDK headers.
+--
+--   luajit tools/gen.lua <ctp_dir> <ctp_ver> <ctpc.h> <out_dir> <cdefs.lua>
+--
+-- Writes:
+--   <out_dir>/ctpc_req.h    one ctp_trader_ReqXxx declaration per ReqXxx
+--   <out_dir>/ctpc_req.cpp  their definitions, and ctpc_build_info()
+--   <cdefs.lua>             cdef text, constants, struct layouts and the
+--                           request -> struct table, for lua/ctp/init.lua
+--
+-- ctpc_build_info() and cdefs.lua carry the same string, derived from the
+-- cdef text, so the Lua side can refuse a library from another build.
+-- Anything in the headers this script does not understand is an error: a
+-- new SDK must not silently lose a request or a field.
+
+local bit = require "bit"
+
+local ctp_dir, ctp_ver, ctpc_h, out_dir, cdefs_path = ...
+if not cdefs_path then
+    io.stderr:write("usage: luajit tools/gen.lua <ctp_dir> <ctp_ver> <ctpc.h> <out_dir> <cdefs.lua>\n")
+    os.exit(2)
+end
+
+local function fail(fmt, ...)
+    io.stderr:write("gen.lua: ", string.format(fmt, ...), "\n")
+    os.exit(1)
+end
+
+local function read(path)
+    local f, err = io.open(path, "rb")
+    if not f then fail("%s", err) end
+    local s = f:read("*a")
+    f:close()
+    return (s:gsub("\r", ""))
+end
+
+local function write(path, s)
+    local f, err = io.open(path, "wb")
+    if not f then fail("%s", err) end
+    f:write(s)
+    f:close()
+end
+
+-- Drop comments and preprocessor lines (with their continuations), and
+-- blank lines. What is left of these headers is plain C declarations.
+local function strip(text)
+    text = text:gsub("/%*.-%*/", "")
+    local out, continued = {}, false
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        if continued or line:match("^%s*#") then
+            continued = line:match("\\%s*$") ~= nil
+        else
+            line = line:gsub("//.*$", "")
+            if line:match("%S") then out[#out + 1] = line end
+        end
+    end
+    return table.concat(out, "\n") .. "\n"
+end
+
+-- FNV-1a, 32 bits.
+local function fnv1a(s)
+    local h = bit.tobit(2166136261)
+    for i = 1, #s do
+        h = bit.bxor(h, s:byte(i))
+        h = bit.tobit(bit.lshift(h, 24) + h * 403) -- h * 16777619 mod 2^32
+    end
+    return bit.tohex(h)
+end
+
+--
+-- ThostFtdcUserApiDataType.h: typedefs and #define constants
+--
+local datatype_h = read(ctp_dir .. "/ThostFtdcUserApiDataType.h")
+
+local datatypes = {} -- name -> { kind, size }
+local constants = {} -- name -> byte (single char) or string
+for line in datatype_h:gmatch("[^\n]+") do
+    local base, name, rest = line:match("^%s*typedef%s+(%w+)%s+([%w_]+)%s*(.-)%s*;")
+    if base then
+        local size = rest:match("^%[(%d+)%]$")
+        if rest ~= "" and not size then fail("typedef %s: unexpected %q", name, rest) end
+        if base == "char" then
+            datatypes[name] = size and { "string", tonumber(size) } or { "char" }
+        elseif (base == "int" or base == "short") and not size then
+            datatypes[name] = { "integer" }
+        elseif base == "double" and not size then
+            datatypes[name] = { "double" }
+        else
+            fail("typedef %s: unsupported type %s%s", name, base, rest)
+        end
+    end
+
+    local cname, value = line:match("^%s*#define%s+([%w_]+)%s+'(.-)'")
+    if cname then
+        constants[cname] = (#value == 1) and value:byte() or value
+    end
+end
+
+--
+-- ThostFtdcUserApiStruct.h: field lists, in declaration order
+--
+local struct_h = strip(read(ctp_dir .. "/ThostFtdcUserApiStruct.h"))
+
+local structs = {} -- name -> { { field, kind, size }, ... }
+for name, body in struct_h:gmatch("struct%s+([%w_]+)%s*(%b{})") do
+    local fields = {}
+    for line in body:sub(2, -2):gmatch("[^\n]+") do
+        if line:match("%S") then
+            local tname, field = line:match("^%s*([%w_]+)%s+([%w_]+)%s*;%s*$")
+            if not tname then fail("struct %s: cannot parse %q", name, line) end
+            local t = datatypes[tname]
+            if not t then fail("struct %s: unknown type %s", name, tname) end
+            fields[#fields + 1] = { field, t[1], t[2] }
+        end
+    end
+    structs[name] = fields
+end
+
+--
+-- ThostFtdcTraderApi.h: virtual int ReqXxx(CThostFtdcYyyField *p, int nRequestID) = 0;
+--
+local requests = {} -- { { name, struct }, ... } in header order
+for line in read(ctp_dir .. "/ThostFtdcTraderApi.h"):gmatch("[^\n]+") do
+    if line:match("virtual%s+int%s+Req") then
+        local name, st = line:match(
+            "^%s*virtual%s+int%s+Req([%w_]+)%s*%(%s*([%w_]+)%s*%*%s*[%w_]+%s*,%s*int%s+nRequestID%s*%)%s*=%s*0%s*;")
+        if not name then fail("unsupported request signature: %s", line) end
+        if not structs[st] then fail("Req%s: unknown struct %s", name, st) end
+        requests[#requests + 1] = { name, st }
+    end
+end
+if #requests == 0 then fail("no requests found in %s/ThostFtdcTraderApi.h", ctp_dir) end
+
+--
+-- ctpc_req.h
+--
+local header = { string.format([[
+// Generated by tools/gen.lua from %s ThostFtdcTraderApi.h; do not edit.
+//
+// One wrapper per CThostFtdcTraderApi::ReqXxx. Each takes the next request
+// id and sends field, which is only read during the call. Returns the
+// request id (> 0), or a negative CTPC_E_* code; the OnRspXxx callbacks
+// carry the same request id.
+#ifndef CTPC_REQ_H
+#define CTPC_REQ_H
+]], ctp_ver) }
+for _, r in ipairs(requests) do
+    header[#header + 1] = string.format("int ctp_trader_Req%s(ctp_trader_t * t, struct %s * field);", r[1], r[2])
+end
+header[#header + 1] = "\n#endif\n"
+local req_h = table.concat(header, "\n")
+
+--
+-- cdef text and build info
+--
+local cdef = strip(datatype_h) .. struct_h .. strip(read(ctpc_h)) .. strip(req_h)
+local build_info = string.format("%s cdef=%s", ctp_ver, fnv1a(cdef))
+
+--
+-- ctpc_req.cpp
+--
+local source = { string.format([[
+// Generated by tools/gen.lua from %s ThostFtdcTraderApi.h; do not edit.
+#include "ThostFtdcTraderApi.h"
+
+extern "C" {
+#include "ctpc.h"
+#include "log.h"
+}
+#include "macros.h"
+
+extern "C" const char * ctpc_build_info(void) {
+    return "%s";
+}
+]], ctp_ver, build_info) }
+for _, r in ipairs(requests) do
+    source[#source + 1] = string.format([[
+extern "C" int ctp_trader_Req%s(ctp_trader_t * t, struct %s * field) {
+    CTPC_TRADER_REQ(t, %s, field);
+}
+]], r[1], r[2], r[1])
+end
+
+--
+-- cdefs.lua
+--
+local function sorted_keys(t)
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = k end
+    table.sort(keys)
+    return keys
+end
+
+-- A long bracket that does not occur in the text.
+local function long_string(s)
+    local eq = ""
+    while s:find("]" .. eq .. "]", 1, true) do eq = eq .. "=" end
+    return "[" .. eq .. "[\n" .. s .. "]" .. eq .. "]"
+end
+
+local lua = { string.format([[
+-- Generated by tools/gen.lua from %s; do not edit.
+return {
+build_info = %q,
+cdef = %s,
+]], ctp_ver, build_info, long_string(cdef)) }
+
+lua[#lua + 1] = "constants = {"
+for _, k in ipairs(sorted_keys(constants)) do
+    local v = constants[k]
+    lua[#lua + 1] = string.format("  %s = %s,", k, type(v) == "number" and tostring(v) or string.format("%q", v))
+end
+lua[#lua + 1] = "},"
+
+-- structs: name = { { field, kind, size }, ... }; size only for strings,
+-- the array length including the terminating zero.
+lua[#lua + 1] = "structs = {"
+for _, name in ipairs(sorted_keys(structs)) do
+    local fields = {}
+    for _, f in ipairs(structs[name]) do
+        fields[#fields + 1] = f[3] and string.format("{%q,%q,%d}", f[1], f[2], f[3])
+            or string.format("{%q,%q}", f[1], f[2])
+    end
+    lua[#lua + 1] = string.format("  %s = {%s},", name, table.concat(fields, ","))
+end
+lua[#lua + 1] = "},"
+
+lua[#lua + 1] = "requests = {"
+for _, r in ipairs(requests) do
+    lua[#lua + 1] = string.format("  %s = %q,", r[1], r[2])
+end
+lua[#lua + 1] = "},"
+lua[#lua + 1] = "}\n"
+
+write(out_dir .. "/ctpc_req.h", req_h)
+write(out_dir .. "/ctpc_req.cpp", table.concat(source, "\n"))
+write(cdefs_path, table.concat(lua, "\n"))
+print(string.format("gen.lua: %s | %d requests | %d structs | %s", ctp_ver, #requests, #sorted_keys(structs), build_info))
