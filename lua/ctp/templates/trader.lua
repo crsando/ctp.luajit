@@ -62,7 +62,7 @@ local status = {
     since = os.time(),
     reconnects = 0,  -- 启动成功后重新就绪的次数
     last_error = nil,
-    session = nil,   -- 最近一次登录：FrontID / SessionID / TradingDay / MaxOrderRef
+    session = nil,   -- 最近一次登录：FrontID / SessionID / TradingDay / UserID / MaxOrderRef
 }
 
 --
@@ -366,6 +366,7 @@ function R.OnRspUserLogin(rsp)
         FrontID = f.FrontID,
         SessionID = f.SessionID,
         TradingDay = f.TradingDay,
+        UserID = f.UserID,
         MaxOrderRef = f.MaxOrderRef,
     }
     service.log.debug("trader | logged in, FrontID %d SessionID %d TradingDay %s, confirming settlement",
@@ -459,6 +460,7 @@ function S.status()
         front_id = session and session.FrontID,
         session_id = session and session.SessionID,
         trading_day = session and session.TradingDay,
+        user_id = session and session.UserID,
     }
 end
 

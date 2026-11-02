@@ -403,7 +403,8 @@ test-lua: all
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_query_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_start_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/collector_test.lua
-	$(LUAJIT) examples/tradelog/clean_test.lua
+	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) examples/tradelog/clean_test.lua
+	python3 examples/tradelog/import_test.py
 
 # ASan/UBSan: overflows and leaked blocks fail the test too.
 $(TEST_DIR)/ctp_rsp_test: tests/c/ctp_rsp_test.c $(SRC_DIR)/trader.c $(SRC_DIR)/msgq.c $(SRC_DIR)/log.c $(GEN_H) | $(TEST_DIR)

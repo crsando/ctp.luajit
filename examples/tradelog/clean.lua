@@ -5,7 +5,7 @@ local M = {}
 -- 记录和汇总行的字段，按这个顺序输出
 M.FIELDS = { "trade_id", "investor_id", "trading_day", "traded_at", "instrument_id",
     "direction", "volume", "price", "commission" }
-M.SUMMARY_FIELDS = { "summary", "investor_id", "trading_day", "count" }
+M.SUMMARY_FIELDS = { "summary", "profile", "symbol", "investor_id", "trading_day", "count" }
 
 local DIRECTION = { ["0"] = "buy", ["1"] = "sell" }
 
@@ -64,7 +64,7 @@ function M.record(t)
         or error("unknown Direction: " .. tostring(t.Direction))
     local time = trim(t.TradeTime)
     return {
-        trade_id = table.concat({ day, trim(t.ExchangeID), trim(t.TradeID), direction }, "."),
+        trade_id = table.concat({ trim(t.InvestorID), day, trim(t.ExchangeID), trim(t.TradeID), direction }, "."),
         investor_id = trim(t.InvestorID),
         trading_day = iso_day(day),
         traded_at = M.calendar_date(day, time) .. "T" .. time .. "+08:00",
@@ -87,8 +87,18 @@ function M.records(trades)
     return out
 end
 
-function M.summary(investor_id, trading_day, count)
-    return { summary = true, investor_id = investor_id, trading_day = iso_day(trading_day), count = count }
+-- 一次运行的汇总，对应 runs 表。账户和交易日来自登录 session，没有成交时也有值；
+-- 成交记录（trades 表）的这两项来自成交回报本身。symbol 非空说明只查了一个合约。
+function M.summary(count, profile, symbol, investor_id, trading_day)
+    if not investor_id or investor_id == "" then error("no investor_id in login session") end
+    return {
+        summary = true,
+        profile = profile,
+        symbol = symbol,
+        investor_id = trim(investor_id),
+        trading_day = iso_day(trading_day or error("no trading day in login session")),
+        count = count,
+    }
 end
 
 local ESCAPE = { ['"'] = '\\"', ["\\"] = "\\\\", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }

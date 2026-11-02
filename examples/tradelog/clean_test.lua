@@ -1,5 +1,5 @@
--- luajit examples/tradelog/clean_test.lua
-package.path = "tests/lua/?.lua;" .. package.path
+-- 从仓库根目录运行：make test-lua（需要 CTPC_LIBDIR，用真实的成交结构体布局）
+package.path = "lua/?.lua;lua/?/init.lua;tests/lua/?.lua;" .. package.path
 local check = require "check"
 local here = arg[0]:match("^(.*/)") or "./"
 local clean = dofile(here .. "clean.lua")
@@ -27,7 +27,7 @@ local function trade(fields)
 end
 
 local r = clean.record(trade())
-check.eq(r.trade_id, "20261102.SHFE.12345.buy", "trade_id")
+check.eq(r.trade_id, "123456.20261102.SHFE.12345.buy", "trade_id")
 check.eq(r.trading_day, "2026-11-02", "trading_day")
 check.eq(r.traded_at, "2026-10-30T21:05:13+08:00", "traded_at")
 check.eq(r.direction, "buy", "direction buy")
@@ -35,11 +35,20 @@ check.eq(clean.record(trade { Direction = 49 }).direction, "sell", "direction se
 check.raises(function () clean.record(trade { Direction = 50 }) end, "unknown Direction", "bad direction")
 
 check.eq(clean.encode(r, clean.FIELDS),
-    '{"trade_id":"20261102.SHFE.12345.buy","investor_id":"123456","trading_day":"2026-11-02",'
+    '{"trade_id":"123456.20261102.SHFE.12345.buy","investor_id":"123456","trading_day":"2026-11-02",'
     .. '"traded_at":"2026-10-30T21:05:13+08:00","instrument_id":"rb2601","direction":"buy",'
     .. '"volume":2,"price":3456.2,"commission":null}', "encode record")
-check.eq(clean.encode(clean.summary("123456", "20261102", 0), clean.SUMMARY_FIELDS),
-    '{"summary":true,"investor_id":"123456","trading_day":"2026-11-02","count":0}', "encode summary")
+
+-- 汇总行的账户和交易日来自登录 session，没有成交时也有值
+check.eq(clean.encode(clean.summary(1, "sim", nil, "123456", "20261102"), clean.SUMMARY_FIELDS),
+    '{"summary":true,"profile":"sim","symbol":null,"investor_id":"123456","trading_day":"2026-11-02","count":1}',
+    "encode summary")
+check.eq(clean.encode(clean.summary(0, "sim", "rb2601", "123456", "20261102"), clean.SUMMARY_FIELDS),
+    '{"summary":true,"profile":"sim","symbol":"rb2601","investor_id":"123456","trading_day":"2026-11-02","count":0}',
+    "encode summary, no trades")
+check.raises(function () clean.summary(0, "sim", nil, nil, "20261102") end, "no investor_id", "summary without investor")
+check.raises(function () clean.summary(0, "sim", nil, "123456", nil) end, "no trading day", "summary without day")
+
 check.eq(clean.encode({ s = 'a"b\\c\n\1' }, { "s" }), '{"s":"a\\"b\\\\c\\n\\u0001"}', "escape")
 check.raises(function () clean.encode({ x = 0 / 0 }, { "x" }) end, "non-finite", "nan")
 
@@ -49,8 +58,23 @@ local rs = clean.records {
     trade { TradeID = "2", TradeTime = "21:00:00" },
     trade { TradeID = "1", TradeTime = "21:00:00", Direction = 49 },
 }
-check.eq(rs[1].trade_id, "20261102.SHFE.1.sell", "sort 1")
-check.eq(rs[2].trade_id, "20261102.SHFE.2.buy", "sort 2")
-check.eq(rs[3].trade_id, "20261102.SHFE.3.buy", "sort 3")
+check.eq(rs[1].trade_id, "123456.20261102.SHFE.1.sell", "sort 1")
+check.eq(rs[2].trade_id, "123456.20261102.SHFE.2.buy", "sort 2")
+check.eq(rs[3].trade_id, "123456.20261102.SHFE.3.buy", "sort 3")
+
+-- 经过真实的结构体：字段名、char 转数字、定长字符串。不同账户的同一成交编号不撞主键
+local ctp = require "ctp"
+local NAME = "CThostFtdcTradeField"
+local function from_struct(fields)
+    return clean.record(ctp.totable(ctp.new_struct(NAME, trade(fields)), NAME))
+end
+local s = from_struct { Direction = "1" }
+check.eq(s.trade_id, "123456.20261102.SHFE.12345.sell", "struct trade_id")
+check.eq(s.direction, "sell", "struct direction")
+check.eq(s.instrument_id, "rb2601", "struct instrument_id")
+check.eq(s.volume, 2, "struct volume")
+check.eq(s.price, 3456.2, "struct price")
+check.eq(s.traded_at, "2026-10-30T21:05:13+08:00", "struct traded_at")
+check.eq(from_struct { InvestorID = "654321" }.trade_id, "654321.20261102.SHFE.12345.buy", "struct other investor")
 
 check.done()

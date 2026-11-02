@@ -20,11 +20,11 @@ function root.boot(...)
     if not server then
         return service.quit("no matching server found for profile: " .. profile_name)
     end
-    service.quit(service.call(0, "run", server, symbol))
+    service.quit(service.call(0, "run", server, profile_name, symbol))
 end
 
 -- 成功返回 nil，失败返回原因
-function root.run(server, symbol)
+function root.run(server, profile_name, symbol)
     service.spawn {
         name = "trader",
         source = [[return require "ctp.templates.trader"]],
@@ -39,7 +39,7 @@ function root.run(server, symbol)
 
     local trades
     trades, err = service.call("trader", "query_trade", symbol)
-    local day = service.call("trader", "status").trading_day
+    local session = service.call("trader", "status")
     service.call("trader", "quit")
 
     if not trades then
@@ -51,7 +51,7 @@ function root.run(server, symbol)
     for i, r in ipairs(records) do
         out[i] = clean.encode(r, clean.FIELDS)
     end
-    out[#out + 1] = clean.encode(clean.summary(server.user, day, #records), clean.SUMMARY_FIELDS)
+    out[#out + 1] = clean.encode(clean.summary(#records, profile_name, symbol, session.user_id, session.trading_day), clean.SUMMARY_FIELDS)
     io.stdout:write(table.concat(out, "\n"), "\n")
     io.stdout:flush()
 end

@@ -66,7 +66,7 @@ local function spawn(...)
     return co, function () return unpack(results or {}) end
 end
 
-local LOGIN = { FrontID = 1, SessionID = 1234, TradingDay = "20261028", MaxOrderRef = "12" }
+local LOGIN = { FrontID = 1, SessionID = 1234, TradingDay = "20261028", UserID = "000001", MaxOrderRef = "12" }
 local CHAIN = { { "OnFrontConnected" }, { "OnRspAuthenticate", 0, {} }, { "OnRspUserLogin", 0, LOGIN } }
 
 -- 1. the whole chain: start returns once the settlement is confirmed
@@ -86,6 +86,7 @@ do
     t.eq(st.state, "ready", "state ready")
     t.eq(st.session_id, 1234, "session id")
     t.eq(st.trading_day, "20261028", "trading day")
+    t.eq(st.user_id, "000001", "user id")
 
     local _, again = spawn()
     t.eq(again(), true, "start while running")
