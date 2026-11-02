@@ -6,16 +6,18 @@
 --   S.stop()
 --   S.status()                 状态、会话、重连次数、最近一次错误
 --   S.query_account() ...      查询，按 1 次/秒流控
---   S.trade(...)               下单并等待结束
---   S.nuke()                   市价平掉全部持仓
+--   S.trade(...)               下单并等待结束（底层：指定价格和开平标志）
+--   S.place(side, symbol, n)   按净持仓下单：先平反向持仓再开仓，对手价让价，按交易所拆平今平昨
+--   S.nuke()                   平掉全部持仓，规则同 place
 --
--- config.query_only = true 时 trade / nuke 直接返回错误，不发任何报单（默认 false）。
+-- config.query_only = true 时 trade / place / nuke 直接返回错误，不发任何报单（默认 false；place 的 dry_run 不受影响）。
 --
 -- 启动成功之后的断线由 CTP 自动重连、libctpc 自动重走登录链路；断线时正在
 -- 执行的查询立即失败，排队中的查询等重新就绪后再发。
 --
 local inspect = require "inspect"
 local ctp = require "ctp"
+local rules = require "ctp.order_rules"
 
 -- local service = require "lservice3" .input(...)
 local service = require "service"
@@ -28,6 +30,10 @@ local config = service.config; do
 
 -- query only: 只允许 query，trade / nuke 直接返回错误，不发任何报单；默认 false
 local QUERY_ONLY = config.query_only == true
+
+-- S.place / S.nuke 的默认值
+local DEFAULT_SLIP_TICKS = 2
+local DEFAULT_TIMEOUT_MS = 5000
 
 local function slice(t, k)
     if not t then return nil end
@@ -528,6 +534,16 @@ function S.query_instrument(symbol)
     end
 end
 
+-- 柜台的行情快照（盘口、涨跌停价），用于给报单定价；查不到时返回 nil, err
+function S.query_depth_market_data(symbol)
+    local err, rst = query:request("QryDepthMarketData", { InstrumentID = symbol })
+    if rst and rst[1] then
+        return rst[1]
+    else
+        return nil, (err and err ~= 0) and err or "no market data"
+    end
+end
+
 -- 当日成交（CTP 只返回当前交易日的成交），可选按合约过滤；没有成交时返回空表
 function S.query_trade(symbol)
     local err, rst = query:request("QryTrade", symbol and { InstrumentID = symbol } or nil)
@@ -835,25 +851,116 @@ function service.on_idle()
     end
 end
 
--- Nuke Every Existing Positions
--- query_only 时返回 nil, "query only"，不查持仓也不报单
-function S.nuke()
-    if QUERY_ONLY then return nil, "query only" end
+--
+-- 按意图下单：S.place / S.nuke
+--
+-- 定价和开平的规则在 ctp.order_rules（纯函数，可离线测试）；这里只负责查询和按腿下单。
 
-    local rst = service.call(service.get_id(), "query_position")
+-- 合约的交易所和最小变动价位，当天不变，查一次就缓存
+local instruments = {}
+local function instrument(symbol)
+    local i = instruments[symbol]
+    if i then return i end
+    local e = S.query_instrument(symbol)
+    if not e or e.InstrumentID ~= symbol then return nil, "unknown instrument " .. tostring(symbol) end
+    i = { ExchangeID = e.ExchangeID, PriceTick = e.PriceTick }
+    instruments[symbol] = i
+    return i
+end
 
-    for _, entry in ipairs(rst) do 
-        local volume; do 
-                volume = entry.Position
-                if entry.PosiDirection == ctp.THOST_FTDC_PD_Long then 
-                    volume = (-1) * volume
-                end
-            end
-        if volume ~= 0 then 
-            -- order:insert(entry.InstrumentID, 0, volume, ctp.THOST_FTDC_OF_Close)
-            service.call(service.get_id(), "trade", entry.InstrumentID, 0, volume, ctp.THOST_FTDC_OF_Close)
+-- 生成报单计划；positions 可以由调用方给出（nuke 已经查过）
+local function plan(side, symbol, volume, opts, positions)
+    if side ~= "buy" and side ~= "sell" then return nil, "side must be buy or sell" end
+    if type(volume) ~= "number" or volume <= 0 or volume % 1 ~= 0 then
+        return nil, "volume must be a positive integer"
+    end
+    local inst, err = instrument(symbol)
+    if not inst then return nil, err end
+    if not positions then
+        positions = S.query_position()
+        if not positions then return nil, "query_position failed" end
+    end
+    local legs, c = rules.close_plan(positions, symbol, side, inst.ExchangeID, volume, opts)
+    local md
+    md, err = S.query_depth_market_data(symbol)
+    if not md then return nil, "query_depth_market_data: " .. tostring(err) end
+    local price
+    price, err = rules.aggressive_price(md, inst.PriceTick, side, opts.slip_ticks or DEFAULT_SLIP_TICKS)
+    if not price then return nil, err .. " for " .. symbol end
+    return {
+        side = side, symbol = symbol, volume = volume, exchange = inst.ExchangeID,
+        price = price, legs = legs, closable = c,
+        market = { bid = md.BidPrice1, ask = md.AskPrice1, last = md.LastPrice, time = md.UpdateTime },
+    }
+end
+
+-- 依次下每条腿；某条腿没有完全成交就停下
+local function execute(p, opts)
+    p.ok = true
+    for i, leg in ipairs(p.legs) do
+        leg.msg, leg.entry = order:trade {
+            symbol = p.symbol, price = p.price, flag = leg.offset,
+            volume = p.side == "buy" and leg.volume or -leg.volume,
+            timeout = opts.timeout or DEFAULT_TIMEOUT_MS,
+        }
+        if leg.msg ~= "complete" then
+            p.ok, p.error = false, string.format("leg %d (%s %d): %s", i,
+                rules.OFFSET_NAME[leg.offset], leg.volume, tostring(leg.msg))
+            break
         end
     end
+    return p
+end
+
+-- 按净持仓下 volume 手：先平反向持仓，剩下的再开仓（持有 2 手多时 sell 3
+-- = 平 2 手多 + 开 1 手空）。上期所/能源中心默认先平昨再平今。
+-- 报单价为对手价让 slip_ticks 个价位（不超过涨跌停），限价当日有效，
+-- timeout 毫秒内没成交就撤单。
+--   opts.slip_ticks        默认 2
+--   opts.timeout           每条腿的超时（毫秒），默认 5000
+--   opts.close_today_first 上期所/能源中心先平今
+--   opts.dry_run           只返回计划，不发报单（query_only 时也可以用）
+-- 返回计划表 { side, symbol, volume, exchange, price, legs, closable, market,
+-- ok, error }，每条腿 { offset, volume, msg, entry }；下单前就失败时返回 nil, err。
+function S.place(side, symbol, volume, opts)
+    opts = opts or {}
+    if QUERY_ONLY and not opts.dry_run then return nil, "query only" end
+    local p, err = plan(side, symbol, volume, opts)
+    if not p then return nil, err end
+    if opts.dry_run then return p end
+    return execute(p, opts)
+end
+
+-- 平掉全部持仓，规则同 S.place（不会开新仓）。已被平仓挂单占用的部分跳过。
+-- 返回每个合约每个方向的结果列表；query_only 时返回 nil, "query only"
+function S.nuke(opts)
+    if QUERY_ONLY then return nil, "query only" end
+    opts = opts or {}
+    local positions = S.query_position()
+    if not positions then return nil, "query_position failed" end
+
+    local seen, results = {}, {}
+    for _, e in ipairs(positions) do
+        local key = e.InstrumentID .. ":" .. tostring(e.PosiDirection)
+        if (e.Position or 0) > 0 and not seen[key] then
+            seen[key] = true
+            local side = e.PosiDirection == ctp.THOST_FTDC_PD_Long and "sell" or "buy"
+            local inst, err = instrument(e.InstrumentID)
+            local r
+            if inst then
+                local c = rules.closable(positions, e.InstrumentID, e.PosiDirection, inst.ExchangeID)
+                local n = c.yd + c.td
+                if n > 0 then
+                    r, err = plan(side, e.InstrumentID, n, opts, positions)
+                    if r then r = execute(r, opts) end
+                else
+                    err = "all closing"
+                end
+            end
+            results[#results + 1] = r or { side = side, symbol = e.InstrumentID, ok = false, error = err }
+        end
+    end
+    return results
 end
 
 -- 返回 msg, entry（同 order:trade）；query_only 时返回 "query only", nil

@@ -122,8 +122,8 @@ lib/<CTP_VER>/                         CTP SDK
 | 9 | 撤单回报 | `OnRspOrderAction` 回显 FrontID/SessionID=0，生成垃圾 key，撤单失败不通知原订单 | 第二轮 |
 | 10 | 超时撤单 | OrderSysID 可能为空；定时器不取消；`_status` 无后续处理 | 第二轮 |
 | 11 | OrderRef | `OnRtnOrder`（含 RESTART 重放）覆盖 `lst_order_ref`；Lua 在调用后读取，与 SPI 线程竞态 | ✅ 第二轮：OrderRef 在 Lua 分配、发单前确定，报单走 `req("OrderInsert")`，发不出时 `trade` 立即返回；删除 `lst_order_ref` 和 `ctp_trader_order_insert` |
-| 12 | 市价单 | 价格为 0 时用 `LastPrice` + IOC，上期所/能源中心等会拒单 | 第二轮：报单语义移到 Lua，按交易所处理 |
-| 13 | `nuke` | 用 `OF_Close` 平仓，上期所/能源中心平今失败；查询失败时 `ipairs(nil)` | 第二轮 |
+| 12 | 市价单 | 价格为 0 时用 `LastPrice` + IOC，上期所/能源中心等会拒单 | 部分 ✅：`S.place` / `S.nuke` 改用对手价让价的限价单（`ctp.order_rules.aggressive_price`），不再发 price=0；底层 `S.trade` 的 price=0 仍是 LastPrice + IOC |
+| 13 | `nuke` | 用 `OF_Close` 平仓，上期所/能源中心平今失败；查询失败时 `ipairs(nil)` | ✅ 第二轮：`nuke` 走 `S.place` 的规则（`ctp.order_rules.close_plan`），上期所/能源中心按今昨拆 '3' / '4'，跳过已在平仓中的部分；查询失败返回错误 |
 | 14 | 改密 | 请求发出即改缓存密码，失败后重连用错密码 | 第二轮：收到成功回报后再改 |
 | 15 | 改密回报 | 不推给 Lua，用 `std::cout` 输出 | 第二轮 |
 | 16 | req_id | 跨线程非原子递增 | ✅ 第一轮：`__atomic_add_fetch` |

@@ -1,4 +1,4 @@
--- Offline tests of the order path in lua/ctp/templates/trader.lua (trade,
+-- Offline tests of the order path in lua/ctp/templates/trader.lua (trade, place,
 -- nuke, config.query_only), with service and service.scheduler replaced by
 -- stubs and trader:order_insert / order_cancel recorded instead of sent.
 -- Run from the repository root: make test-lua.
@@ -193,28 +193,132 @@ do
     t.eq(wait(), "canceled", "next order after a failure works")
 end
 
--- 7. nuke: long positions are sold, short ones bought, both as close orders
+-- place / nuke: queries replaced, order:trade recorded and answered by
+-- fills; each leg { symbol, price, volume, flag, timeout }
+local DBL_MAX = 1.7976931348623157e308
+local function stub_market(S, positions, opts)
+    opts = opts or {}
+    local rec = { legs = {}, queries = 0 }
+    local inst = {
+        IF2611 = { InstrumentID = "IF2611", ExchangeID = "CFFEX", PriceTick = 0.2 },
+        cu2612 = { InstrumentID = "cu2612", ExchangeID = "SHFE", PriceTick = 10 },
+    }
+    S.query_instrument = function (symbol)
+        rec.queries = rec.queries + 1
+        return inst[symbol] or {}
+    end
+    S.query_position = function () return positions end
+    S.query_depth_market_data = function (symbol)
+        if opts.no_md then return nil, "no market data" end
+        return { BidPrice1 = 3965.8, AskPrice1 = 3966.2, LastPrice = 3966,
+                 UpperLimitPrice = DBL_MAX, LowerLimitPrice = DBL_MAX }
+    end
+    local results = opts.results or {}
+    S._order.trade = function (self, args)
+        rec.legs[#rec.legs + 1] = args
+        return results[#rec.legs] or "complete", { OrderSysID = tostring(#rec.legs) }
+    end
+    return rec
+end
+
+local L, Sh = ctp.THOST_FTDC_PD_Long, ctp.THOST_FTDC_PD_Short
+local TD, YD = ctp.THOST_FTDC_PSD_Today, ctp.THOST_FTDC_PSD_History
+
+-- 7. place: flat -> open at the aggressive price
 do
     local S = load_trader()
-    calls = {}
-    service.call = function (id, fn, ...)
-        calls[#calls + 1] = { fn, ... }
-        if fn == "query_position" then
-            return {
-                { InstrumentID = "rb2601", PosiDirection = ctp.THOST_FTDC_PD_Long, Position = 2 },
-                { InstrumentID = "ag2612", PosiDirection = ctp.THOST_FTDC_PD_Short, Position = 3 },
-                { InstrumentID = "au2612", PosiDirection = ctp.THOST_FTDC_PD_Long, Position = 0 },
-            }
-        end
-    end
-    S.nuke()
-    t.eq(#calls, 3, "nuke: one query and two trades")
-    t.eq(calls[2][1], "trade", "nuke trades")
-    t.eq(calls[2][2], "rb2601", "nuke long symbol")
-    t.eq(calls[2][4], -2, "nuke sells the long position")
-    t.eq(calls[2][5], ctp.THOST_FTDC_OF_Close, "nuke closes")
-    t.eq(calls[3][2], "ag2612", "nuke short symbol")
-    t.eq(calls[3][4], 3, "nuke buys back the short position")
+    local rec = stub_market(S, {})
+    local p = S.place("sell", "IF2611", 1)
+    t.eq(p.ok, true, "place ok")
+    t.eq(#rec.legs, 1, "place: one leg")
+    t.eq(rec.legs[1].flag, ctp.THOST_FTDC_OF_Open, "place: flat opens")
+    t.eq(rec.legs[1].volume, -1, "place: sell is negative")
+    t.eq(rec.legs[1].price, 3965.4, "place: bid - 2 ticks")
+    t.eq(rec.legs[1].timeout, 5000, "place: default timeout")
+    t.eq(p.legs[1].msg, "complete", "place: leg result kept")
+    t.eq(p.exchange, "CFFEX", "place: exchange")
+
+    S.place("buy", "IF2611", 1, { slip_ticks = 0, timeout = 800 })
+    t.eq(rec.legs[2].price, 3966.2, "place: slip_ticks option")
+    t.eq(rec.legs[2].timeout, 800, "place: timeout option")
+    t.eq(rec.queries, 1, "place: instrument cached")
+end
+
+-- 8. place: net position, SHFE split, stop on a failed leg
+do
+    local S = load_trader()
+    local rec = stub_market(S, {
+        { InstrumentID = "cu2612", PosiDirection = L, PositionDate = YD, Position = 2, ShortFrozen = 0 },
+        { InstrumentID = "cu2612", PosiDirection = L, PositionDate = TD, Position = 1, ShortFrozen = 0 },
+    })
+    local p = S.place("sell", "cu2612", 4)
+    t.eq(#rec.legs, 3, "net: three legs")
+    t.eq(rec.legs[1].flag, ctp.THOST_FTDC_OF_CloseYesterday, "net: close yesterday first")
+    t.eq(rec.legs[1].volume, -2, "net: yesterday 2")
+    t.eq(rec.legs[2].flag, ctp.THOST_FTDC_OF_CloseToday, "net: then today")
+    t.eq(rec.legs[3].flag, ctp.THOST_FTDC_OF_Open, "net: open the rest")
+    t.eq(rec.legs[3].volume, -1, "net: open 1")
+    t.eq(p.ok, true, "net: ok")
+
+    rec = stub_market(S, {
+        { InstrumentID = "cu2612", PosiDirection = L, PositionDate = YD, Position = 2, ShortFrozen = 0 },
+    }, { results = { "canceled" } })
+    p = S.place("sell", "cu2612", 3)
+    t.eq(#rec.legs, 1, "failed leg: stops")
+    t.eq(p.ok, false, "failed leg: not ok")
+    t.eq(p.error, "leg 1 (close_yesterday 2): canceled", "failed leg: error")
+end
+
+-- 9. place: dry run, bad input, query_only
+do
+    local S = load_trader()
+    local rec = stub_market(S, {})
+    local p = S.place("buy", "IF2611", 1, { dry_run = true })
+    t.eq(#rec.legs, 0, "dry run: nothing sent")
+    t.eq(p.legs[1].offset, ctp.THOST_FTDC_OF_Open, "dry run: plan")
+    t.eq(p.ok, nil, "dry run: not executed")
+
+    t.eq(select(2, S.place("hold", "IF2611", 1)), "side must be buy or sell", "bad side")
+    t.eq(select(2, S.place("buy", "IF2611", 0)), "volume must be a positive integer", "bad volume")
+    t.eq(select(2, S.place("buy", "xx9999", 1)), "unknown instrument xx9999", "unknown instrument")
+    stub_market(S, {}, { no_md = true })
+    t.eq(select(2, S.place("buy", "IF2611", 1)), "query_depth_market_data: no market data", "no market data")
+
+    S = load_trader { query_only = true }
+    rec = stub_market(S, {})
+    t.eq(select(2, S.place("buy", "IF2611", 1)), "query only", "query_only: place refused")
+    t.eq(S.place("buy", "IF2611", 1, { dry_run = true }).legs[1].volume, 1, "query_only: dry run allowed")
+    t.eq(#rec.legs, 0, "query_only: nothing sent")
+end
+
+-- 10. nuke: every position closed by exchange rules, nothing opened
+do
+    local S = load_trader()
+    local rec = stub_market(S, {
+        { InstrumentID = "cu2612", PosiDirection = L, PositionDate = YD, Position = 1, ShortFrozen = 0 },
+        { InstrumentID = "cu2612", PosiDirection = L, PositionDate = TD, Position = 2, ShortFrozen = 0 },
+        { InstrumentID = "IF2611", PosiDirection = Sh, PositionDate = YD, Position = 3, LongFrozen = 1 },
+        { InstrumentID = "IF2611", PosiDirection = L, PositionDate = YD, Position = 0, ShortFrozen = 0 },
+    })
+    local r = S.nuke()
+    t.eq(#r, 2, "nuke: one result per symbol and direction")
+    t.eq(#rec.legs, 3, "nuke: three legs")
+    t.eq(rec.legs[1].flag, ctp.THOST_FTDC_OF_CloseYesterday, "nuke: shfe yesterday")
+    t.eq(rec.legs[1].volume, -1, "nuke: sells the long")
+    t.eq(rec.legs[2].flag, ctp.THOST_FTDC_OF_CloseToday, "nuke: shfe today with '3'")
+    t.eq(rec.legs[2].volume, -2, "nuke: today 2")
+    t.eq(rec.legs[3].flag, ctp.THOST_FTDC_OF_Close, "nuke: cffex close")
+    t.eq(rec.legs[3].volume, 2, "nuke: buys back what is not already closing")
+    t.eq(r[1].ok and r[2].ok, true, "nuke: ok")
+
+    stub_market(S, {
+        { InstrumentID = "IF2611", PosiDirection = Sh, PositionDate = YD, Position = 1, LongFrozen = 1 },
+    })
+    r = S.nuke()
+    t.eq(r[1].error, "all closing", "nuke: fully frozen skipped")
+
+    S.query_position = function () return nil end
+    t.eq(select(2, S.nuke()), "query_position failed", "nuke: query failure")
 end
 
 t.done()
