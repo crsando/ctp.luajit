@@ -118,10 +118,12 @@ typedef struct _ctp_trader_t {
     int state; // CTPC_TRADER_*
 
     // session info, from OnRspUserLogin
+    // Written by the SPI thread at login. Lua does not read these to place
+    // orders: it takes the session from the OnRspUserLogin message and
+    // allocates order refs itself (Trader:next_order_ref in lua/ctp/init.lua).
     int front_id;
     int	session_id;	//会话编号
     char max_order_ref[13];	//报单引用
-    char lst_order_ref[13];
 
     // class pointer
     void * _spi;
@@ -173,10 +175,6 @@ enum {
     CTPC_E_INVALID = -101,      // NULL trader or field
     CTPC_E_UNKNOWN = -102,      // CTP returned an undocumented code
 };
-
-// Order insertion keeps its hand-written wrapper until order refs move to
-// Lua; returns like ctp_trader_ReqOrderInsert.
-int ctp_trader_order_insert(ctp_trader_t * t, const char * symbol, double price, int volume, char flag);
 
 // "<ctp version> cdef=<hash>"; the generated cdefs.lua must carry the same.
 const char * ctpc_build_info(void);

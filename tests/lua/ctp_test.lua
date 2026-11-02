@@ -134,4 +134,94 @@ do
         "longer than", "oversized request field")
 end
 
+-- order refs: allocated in Lua from the login's MaxOrderRef, never going back
+do
+    local trader = ctp.new_trader { front_addr = "tcp://127.0.0.1:1", broker = "9999", user = "000001", pass = "p" }
+    local ref, err = trader:next_order_ref()
+    t.eq(ref, nil, "no order ref before login")
+    t.eq(err, "not logged in", "no order ref before login message")
+    local o
+    o, err = trader:order_insert("rb2601", 3500, 1, ctp.THOST_FTDC_OF_Open)
+    t.eq(o, nil, "order_insert before login")
+    t.eq(err, "not logged in", "order_insert before login message")
+
+    local function login(front, session, max_ref, error_id)
+        trader:on_login { func_name = "OnRspUserLogin",
+            field = { FrontID = front, SessionID = session, MaxOrderRef = max_ref },
+            rsp_info = error_id and { ErrorID = error_id, ErrorMsg = "" } or nil }
+    end
+
+    login(1, 100, "7")
+    t.eq(trader:next_order_ref(), "000000000008", "first ref is MaxOrderRef + 1")
+    t.eq(trader:next_order_ref(), "000000000009", "refs increase")
+    t.eq(trader.session.SessionID, 100, "session from login")
+
+    login(1, 200, "3") -- reconnect, server grants a lower ref
+    t.eq(trader:next_order_ref(), "000000000010", "refs never go back across logins")
+    t.eq(trader.session.SessionID, 200, "session follows the new login")
+    login(1, 300, "            ") -- blank MaxOrderRef
+    t.eq(trader:next_order_ref(), "000000000011", "blank MaxOrderRef")
+    login(1, 400, "100")
+    t.eq(trader:next_order_ref(), "000000000101", "higher MaxOrderRef wins")
+    login(9, 999, "5000", 3) -- failed login
+    t.eq(trader.session.SessionID, 400, "failed login ignored")
+    t.eq(trader:next_order_ref(), "000000000102", "failed login keeps refs")
+
+    -- not started: the request fails, nothing is returned, the ref is spent
+    o, err = trader:order_insert("rb2601", 3500, 1, ctp.THOST_FTDC_OF_Open)
+    t.eq(o, nil, "order_insert not started")
+    t.eq(err, "trader not started", "order_insert not started message")
+    t.eq(trader.order_ref, 103, "failed insert spends its ref")
+    t.eq((trader:order_insert("rb2601", 3500, 0, ctp.THOST_FTDC_OF_Open)), nil, "zero volume refused")
+    t.eq(trader.order_ref, 103, "zero volume spends no ref")
+
+    -- the fields sent, captured instead of sent
+    local sent
+    trader.req = function (self, name, fields)
+        sent = ctp.totable(self:request_struct(name, fields), "CThostFtdcInputOrderField")
+        return 42
+    end
+    o = trader:order_insert("rb2601", 3500, -2, ctp.THOST_FTDC_OF_Close)
+    t.eq(o.OrderRef, "000000000104", "identity: OrderRef")
+    t.eq(o.FrontID, 1, "identity: FrontID")
+    t.eq(o.SessionID, 400, "identity: SessionID")
+    t.eq(o.BrokerID, "9999", "identity: BrokerID")
+    t.eq(o.InvestorID, "000001", "identity: InvestorID")
+    t.eq(sent.OrderRef, "000000000104", "sent OrderRef")
+    t.eq(sent.InstrumentID, "rb2601", "sent InstrumentID")
+    t.eq(sent.BrokerID, "9999", "sent BrokerID")
+    t.eq(sent.Direction, ctp.THOST_FTDC_D_Sell, "negative volume sells")
+    t.eq(sent.VolumeTotalOriginal, 2, "volume")
+    t.eq(sent.CombOffsetFlag, string.char(ctp.THOST_FTDC_OF_Close), "offset flag")
+    t.eq(sent.CombHedgeFlag, string.char(ctp.THOST_FTDC_HF_Speculation), "hedge flag")
+    t.eq(sent.OrderPriceType, ctp.THOST_FTDC_OPT_LimitPrice, "limit order")
+    t.eq(sent.LimitPrice, 3500, "limit price")
+    t.eq(sent.TimeCondition, ctp.THOST_FTDC_TC_GFD, "limit order is GFD")
+    t.eq(sent.VolumeCondition, ctp.THOST_FTDC_VC_AV, "any volume")
+    t.eq(sent.MinVolume, 1, "min volume")
+    t.eq(sent.ContingentCondition, ctp.THOST_FTDC_CC_Immediately, "immediately")
+    t.eq(sent.ForceCloseReason, ctp.THOST_FTDC_FCC_NotForceClose, "not force close")
+
+    o = trader:order_insert("rb2601", 0, 1, "0")
+    t.eq(o.OrderRef, "000000000105", "next ref")
+    t.eq(sent.Direction, ctp.THOST_FTDC_D_Buy, "positive volume buys")
+    t.eq(sent.CombOffsetFlag, "0", "offset flag as a string")
+    t.eq(sent.OrderPriceType, ctp.THOST_FTDC_OPT_LastPrice, "price 0: last price")
+    t.eq(sent.TimeCondition, ctp.THOST_FTDC_TC_IOC, "price 0: IOC")
+    t.eq(sent.LimitPrice, 0, "price 0: no limit price")
+
+    -- recv takes the session from a login message itself: queue one as the
+    -- SPI thread would
+    local dir = os.getenv("CTPC_LIBDIR")
+    local C = ffi.load(dir .. (ffi.os == "OSX" and "/libctpc.dylib" or "/libctpc.so"))
+    local tr = ctp.new_trader { front_addr = "tcp://127.0.0.1:1", broker = "9999", user = "000001", pass = "p" }
+    local f = ctp.new_struct("CThostFtdcRspUserLoginField", { FrontID = 5, SessionID = 77, MaxOrderRef = "41" })
+    C.ctp_trader_send(tr.trader, C.ctp_rsp_new("OnRspUserLogin", "CThostFtdcRspUserLoginField", 1, true,
+        f, ffi.sizeof(f), nil, 0))
+    local msg = tr:recv(false)
+    t.eq(msg and msg.func_name, "OnRspUserLogin", "login message received")
+    t.eq(tr.session and tr.session.SessionID, 77, "recv sets the session")
+    t.eq(tr:next_order_ref(), "000000000042", "recv grants MaxOrderRef")
+end
+
 t.done()

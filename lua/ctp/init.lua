@@ -358,6 +358,8 @@ function M.new_trader(server)
         trader = trader,
         -- filled into every request whose struct has these fields
         defaults = { BrokerID = server.broker, InvestorID = server.user },
+        session = nil, -- FrontID / SessionID of the last login; see on_login
+        order_ref = 0, -- the last order ref allocated or granted by a login
     }, Trader)
 end
 
@@ -428,23 +430,84 @@ function Trader:recv_raw(blocking)
     return C.ctp_trader_recv(self.trader, blocking)
 end
 
+-- The next message as a table, or nil. A successful OnRspUserLogin also
+-- updates the session (on_login) before it is returned.
 function Trader:recv(blocking)
     local rsp = C.ctp_trader_recv(self.trader, blocking)
     local t = cast_rsp(rsp)
     C.ctp_rsp_free(rsp)
+    if t and t.func_name == "OnRspUserLogin" then self:on_login(t) end
     return t
 end
 
+--
+-- order refs
+--
+-- Allocated here, in the one thread that owns the trader, and fixed before
+-- the order is sent: the SPI thread never touches them. CTP wants them
+-- increasing within a session (ErrorID 22 otherwise). A login grants
+-- MaxOrderRef; the next ref is above both it and every ref used before, so
+-- refs never go back across reconnects either.
+
+-- Take the session from an OnRspUserLogin message; failed logins are ignored.
+function Trader:on_login(rsp)
+    local f = rsp and rsp.field
+    if not f or (rsp.rsp_info and rsp.rsp_info.ErrorID ~= 0) then return end
+    self.session = { FrontID = f.FrontID, SessionID = f.SessionID }
+    self.order_ref = math.max(self.order_ref, tonumber(f.MaxOrderRef) or 0)
+end
+
+-- The next order ref, as 12 digits (TThostFtdcOrderRefType holds 12), or nil
+-- and an error before the first login.
+function Trader:next_order_ref()
+    if not self.session then return nil, "not logged in" end
+    self.order_ref = self.order_ref + 1
+    return string.format("%012d", self.order_ref)
+end
+
+-- Insert an order. symbol: InstrumentID; price < 0.0001: LastPrice + IOC,
+-- otherwise a limit order good for the day; volume: buy when positive, sell
+-- when negative; flag: the offset, THOST_FTDC_OF_* (a byte or a 1-char
+-- string). Returns the order's identity, BrokerID / InvestorID / FrontID /
+-- SessionID / OrderRef, as CTP reports it back in OnRtnOrder; or nil and an
+-- error when the order could not be sent.
 function Trader:order_insert(symbol, price, volume, flag)
-    C.ctp_trader_order_insert(self.trader, symbol, price, volume, flag)
-    local order = {}; do
-        order.BrokerID = ffi.string(self.trader.broker)
-        order.InvestorID = ffi.string(self.trader.user)
-        order.FrontID = tonumber(self.trader.front_id)
-        order.SessionID = tonumber(self.trader.session_id)
-        order.OrderRef = ffi.string(self.trader.lst_order_ref)
+    if type(volume) ~= "number" or volume == 0 then
+        return nil, "volume must be a non-zero number"
     end
-    return order
+    local ref, err = self:next_order_ref()
+    if not ref then return nil, err end
+    local fields = {
+        InstrumentID = symbol,
+        OrderRef = ref,
+        Direction = volume > 0 and M.THOST_FTDC_D_Buy or M.THOST_FTDC_D_Sell,
+        VolumeTotalOriginal = math.abs(volume),
+        CombOffsetFlag = type(flag) == "number" and string.char(flag) or flag,
+        CombHedgeFlag = string.char(M.THOST_FTDC_HF_Speculation),
+        VolumeCondition = M.THOST_FTDC_VC_AV,
+        MinVolume = 1,
+        ContingentCondition = M.THOST_FTDC_CC_Immediately,
+        ForceCloseReason = M.THOST_FTDC_FCC_NotForceClose,
+        IsAutoSuspend = 0,
+        UserForceClose = 0,
+    }
+    if price < 0.0001 then
+        fields.OrderPriceType = M.THOST_FTDC_OPT_LastPrice
+        fields.TimeCondition = M.THOST_FTDC_TC_IOC -- 立即成交否则撤销
+    else
+        fields.OrderPriceType = M.THOST_FTDC_OPT_LimitPrice
+        fields.LimitPrice = price
+        fields.TimeCondition = M.THOST_FTDC_TC_GFD -- 当日有效
+    end
+    local rc, msg = self:req("OrderInsert", fields)
+    if rc < 0 then return nil, msg end
+    return {
+        BrokerID = self.defaults.BrokerID,
+        InvestorID = self.defaults.InvestorID,
+        FrontID = self.session.FrontID,
+        SessionID = self.session.SessionID,
+        OrderRef = ref,
+    }
 end
 
 -- order_cancel(order) or order_cancel(symbol, exchange_id, order_sys_id)

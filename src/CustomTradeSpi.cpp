@@ -102,7 +102,6 @@ void CustomTradeSpi::OnRspUserLogin(
 		this->_trader->front_id = pRspUserLogin->FrontID;
 		this->_trader->session_id = pRspUserLogin->SessionID;
 		strcpy(this->_trader->max_order_ref, pRspUserLogin->MaxOrderRef);
-		strcpy(this->_trader->lst_order_ref, pRspUserLogin->MaxOrderRef);
 		set_state(this->_trader, CTPC_TRADER_LOGGED_IN);
 	}
 	else if (pRspInfo != NULL)
@@ -207,13 +206,6 @@ void CustomTradeSpi::OnRtnOrder(CThostFtdcOrderField *pField)
 {
     char submit_status[128];
     char order_status[128];
-	// FrontID + SessionID + OrderRef. Only this session's orders move the last
-	// order ref, and only forward: the private stream replays earlier
-	// sessions' orders on (re)connect, whose refs must not be reused.
-	if (pField->FrontID == this->_trader->front_id && pField->SessionID == this->_trader->session_id
-		&& atoi(pField->OrderRef) > atoi(this->_trader->lst_order_ref))
-		strcpy(this->_trader->lst_order_ref, pField->OrderRef);
-
     switch (pField->OrderSubmitStatus) {
     case THOST_FTDC_OSS_InsertSubmitted:
         snprintf(submit_status, 128, "THOST_FTDC_OSS_InsertSubmitted");

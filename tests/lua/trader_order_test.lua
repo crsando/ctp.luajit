@@ -10,6 +10,7 @@ local ctp = require "ctp"
 
 local noop = function () end
 local timers = {} -- callbacks given to service.set_timeout, in order
+local timer_ms = {} -- and their delays
 local calls = {}  -- service.call(self, ...) made by the template
 
 package.loaded["service.scheduler"] = { at = noop }
@@ -24,6 +25,7 @@ local service = {
     yield_session = coroutine.yield,
     set_timeout = function (ms, cb)
         timers[#timers + 1] = cb
+        timer_ms[#timers] = ms
         return { stop = noop, close = noop }
     end,
 }
@@ -39,11 +41,14 @@ local function load_trader(extra)
     local S = require "ctp.templates.trader"
     local trader = S._trader
 
+    -- rec.fail: the error the next inserts fail with, as trader:order_insert
+    -- does when the request cannot be sent
     local rec = { inserts = {}, cancels = {}, inbox = {} }
     local ref = 0
     trader.order_insert = function (self, symbol, price, volume, flag)
-        ref = ref + 1
         rec.inserts[#rec.inserts + 1] = { symbol = symbol, price = price, volume = volume, flag = flag }
+        if rec.fail then return nil, rec.fail end
+        ref = ref + 1
         return { BrokerID = "9999", InvestorID = "000001", FrontID = 1, SessionID = 2,
                  OrderRef = string.format("%012d", ref) }
     end
@@ -155,6 +160,37 @@ do
         field = order_field(1, { OrderStatus = ctp.THOST_FTDC_OST_Canceled }) }
     service.on_idle()
     t.eq(wait(), "canceled", "trade canceled after timeout")
+end
+
+-- 6b. timeout: only the table form takes one; the positional form arms none
+do
+    local S = load_trader()
+    timers = {}
+    spawn(S.trade, "rb2601", 3500, 1, ctp.THOST_FTDC_OFEN_Open)
+    t.eq(#timers, 0, "positional trade: no timeout")
+    spawn(S.trade, { symbol = "rb2601", price = 3500, volume = 1, timeout = "250" })
+    t.eq(#timers, 1, "timeout given as a string")
+    t.eq(timer_ms[1], 250, "timeout converted to a number")
+end
+
+-- 6c. an insert that cannot be sent fails at once and leaves nothing behind
+do
+    local S, rec = load_trader()
+    rec.fail = "too many requests per second"
+    local msg, entry = spawn(S.trade, "rb2601", 3500, 1, ctp.THOST_FTDC_OFEN_Open)()
+    t.eq(msg, "order insertion failed: too many requests per second", "send failure returned")
+    t.eq(entry, nil, "send failure: no entry")
+    t.eq(next(S._order.cache), nil, "send failure: nothing cached")
+    local o, err = S._order:insert("rb2601", 3500, 1, ctp.THOST_FTDC_OFEN_Open)
+    t.eq(o, nil, "insert: nil on failure")
+    t.eq(err, "too many requests per second", "insert: error on failure")
+
+    rec.fail = nil
+    local wait = spawn(S.trade, "rb2601", 3500, 1, ctp.THOST_FTDC_OFEN_Open)
+    rec.inbox[#rec.inbox + 1] = { func_name = "OnRtnOrder",
+        field = order_field(1, { OrderStatus = ctp.THOST_FTDC_OST_Canceled }) }
+    service.on_idle()
+    t.eq(wait(), "canceled", "next order after a failure works")
 end
 
 -- 7. nuke: long positions are sold, short ones bought, both as close orders

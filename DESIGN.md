@@ -75,8 +75,9 @@ lib/<CTP_VER>/                         CTP SDK
   最后一个错误（`OnRspError`、断线原因），例如 SDK 与前置不匹配的握手失败 4040。
 - 启动和重连时私有流重放的委托/成交照常交给订单簿（不再在启动期间丢弃）。
 - 断线时正在执行的查询立即失败；未启动时查询立即失败。
-- `OnRtnOrder` 只接受本会话（FrontID+SessionID 匹配）且更大的 OrderRef，避免重放的旧订单
-  把 `lst_order_ref` 拉回去造成重复引用（#11 的一部分）。
+- OrderRef 由 Lua 分配（`Trader:next_order_ref`）：`Trader:recv` 看到成功的 `OnRspUserLogin`
+  时记下 FrontID/SessionID，下一个 ref 取 `max(MaxOrderRef, 用过的最大值) + 1`，跨重连也只增不减；
+  SPI 线程不再改写 OrderRef（#11）。
 
 ### 2.6 CTP SDK 输出改道
 
@@ -120,7 +121,7 @@ lib/<CTP_VER>/                         CTP SDK
 | 8 | 订单终态 | 只在 `OnRtnTrade` 判断全成，`OnRtnOrder(AllTraded)` 晚到时订单永不结束 | 第二轮 |
 | 9 | 撤单回报 | `OnRspOrderAction` 回显 FrontID/SessionID=0，生成垃圾 key，撤单失败不通知原订单 | 第二轮 |
 | 10 | 超时撤单 | OrderSysID 可能为空；定时器不取消；`_status` 无后续处理 | 第二轮 |
-| 11 | OrderRef | `OnRtnOrder`（含 RESTART 重放）覆盖 `lst_order_ref`；Lua 在调用后读取，与 SPI 线程竞态 | 重放覆盖 ✅（2.5）；竞态留到第二轮：OrderRef 移到 Lua，报单走 `req("OrderInsert")` |
+| 11 | OrderRef | `OnRtnOrder`（含 RESTART 重放）覆盖 `lst_order_ref`；Lua 在调用后读取，与 SPI 线程竞态 | ✅ 第二轮：OrderRef 在 Lua 分配、发单前确定，报单走 `req("OrderInsert")`，发不出时 `trade` 立即返回；删除 `lst_order_ref` 和 `ctp_trader_order_insert` |
 | 12 | 市价单 | 价格为 0 时用 `LastPrice` + IOC，上期所/能源中心等会拒单 | 第二轮：报单语义移到 Lua，按交易所处理 |
 | 13 | `nuke` | 用 `OF_Close` 平仓，上期所/能源中心平今失败；查询失败时 `ipairs(nil)` | 第二轮 |
 | 14 | 改密 | 请求发出即改缓存密码，失败后重连用错密码 | 第二轮：收到成功回报后再改 |

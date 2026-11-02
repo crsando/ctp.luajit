@@ -600,9 +600,14 @@ local order = {
     -- methods
     --
     
-    -- 单纯的插入订单，不等待
+    -- 单纯的插入订单，不等待；发不出去时返回 nil, err，不进 cache
+    -- OrderRef 在发单前就已分配好；回报只在 on_idle 里处理，所以发单后再登记不会漏
     insert = function (self, symbol, price, volume, flag)
-            local o = trader:order_insert(symbol, price, volume, flag)
+            local o, err = trader:order_insert(symbol, price, volume, flag)
+            if not o then
+                service.log.warn("order insert %s failed: %s", tostring(symbol), tostring(err))
+                return nil, err
+            end
             local key = make_order_hashkey(o)
             do 
                 o._key = key
@@ -628,8 +633,6 @@ local order = {
             local n_args = select("#", ...)
             local args = {...}
 
-            args.timeout = tonumber(args.timeout)
-
             if (n_args == 1) and (type(args[1]) == "table") then 
                 args = args[1]
                 symbol, price, volume, flag = args.symbol, args.price, args.volume, args.flag
@@ -638,6 +641,9 @@ local order = {
             else 
                 return "invalid args", nil
             end
+
+            -- 只有 table 形式能带 timeout（毫秒）
+            local timeout = tonumber(args.timeout)
 
             if not symbol then 
                 return "no symbol", nil
@@ -649,7 +655,7 @@ local order = {
             price = price or 0.0 -- 默认市价单
             flag = flag or ctp.THOST_FTDC_OFEN_Open -- 默认开仓
 
-            local o = self:insert(symbol, price, volume, flag)
+            local o, err = self:insert(symbol, price, volume, flag)
 
             if o and o._key then 
                 local co = service.get_session()
@@ -657,9 +663,9 @@ local order = {
                 
                 -- timeout mechanisim
 
-                if args.timeout then 
+                if timeout then 
                     -- 超时自动撤单
-                    service.set_timeout(args.timeout, function()
+                    service.set_timeout(timeout, function()
                             -- 注意我们假定 cancel一定会完成，这里不额外的超时处理
                             -- cancel 成功后，会自动执行 order:finish()，进而resume回到下面的coroutine.yield()那里
                             if not o._traded then 
@@ -673,7 +679,7 @@ local order = {
                 local msg, entry = coroutine.yield()
                 return msg, entry
             else 
-                return "order insertion failed", nil
+                return "order insertion failed: " .. tostring(err), nil
             end 
         end,
 
@@ -768,6 +774,7 @@ local order = {
             return count
         end,
 }
+S._order = order -- expose (tests)
 
 
 -- Explicit Define OnRtnOrder/OnRtnTrade
