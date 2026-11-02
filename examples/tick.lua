@@ -1,22 +1,18 @@
--- 监听一个合约的 tick，逐条打印：
+-- 监听合约的 tick，逐条打印：
 --
---   luajit examples/tick.lua <symbol> [profile]
+--   luajit examples/tick.lua <profile> <symbol> [symbol ...]
 --
--- symbol 如 IM2703；profile 是 ~/.ctp.luajit/accounts.lua 里 collector 下的名字，
--- 默认 hy-sim。Ctrl-C 退出。
+-- profile 是 ~/.ctp.luajit/accounts.lua 里 collector 下的名字，如 simnow-7x24；
+-- symbol 如 IM2703，可以一次给多个。Ctrl-C 退出。
 local service = require "service"
 local root = require "service.root"
 local accounts = require "ctp.accounts"
 
-function root.boot(symbol, profile)
-    profile = profile or "hy-sim"
-    local server = accounts["collector"][profile]
-
-    if not symbol then
-        service.log.error("usage: luajit examples/tick.lua <symbol> [profile]")
-        return service.quit()
-    elseif not server then
-        service.log.error("no matching server found for profile: " .. profile)
+function root.boot(profile, ...)
+    local symbols = { ... }
+    local server = profile and accounts["collector"][profile]
+    if not server or #symbols == 0 then
+        service.log.error("usage: luajit examples/tick.lua <profile> <symbol> [symbol ...]")
         return service.quit()
     end
 
@@ -34,17 +30,22 @@ function root.boot(symbol, profile)
             return S
         ]],
         config = { server = server },
+        mailbox_size = 8096,
     }
 
     local ok, err = service.call("collector", "start")
     if not ok then
         service.log.error("collector start failed: %s", err)
-        service.call("collector", "quit")
-        return service.quit()
+        return root.quit()
     end
 
-    service.call("collector", "subscribe", symbol)
-    service.log.info("listening %s on %s (%s), Ctrl-C to quit", symbol, profile, server.front_addr)
+    ok, err = service.call("collector", "subscribe", symbols)
+    if not ok then
+        service.log.error("subscribe failed: %s", err)
+        return root.quit()
+    end
+    service.log.info("subscribed %s on %s (%s), Ctrl-C to quit",
+        table.concat(symbols, " "), profile, server.front_addr)
 
     -- 不 quit：root 继续运行，tick 由 collector 打印。CTP SDK 的线程会让默认的
     -- SIGINT 结束不了进程，所以自己处理 Ctrl-C / SIGTERM，先停 collector 再退出。
