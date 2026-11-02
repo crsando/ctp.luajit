@@ -7,8 +7,8 @@
 #                                      ctp-6.7.13-macos on macOS)
 #   make DEBUG=1                      -O0, no fortify (for gdb)
 #   make WERROR=1                     treat warnings as errors (CI)
-#   make install                      install to $(PREFIX) (default: prefix
-#                                     of the luajit in PATH; sudo if needed)
+#   make install                      install to $(PREFIX) (default: /usr/local
+#                                     on macOS, else the luajit's prefix; sudo)
 #   make install DESTDIR=/tmp/stage   staged install (packaging)
 #   make test                         run the C, generator and Lua tests
 #   make check-log                    verify src/log.{c,h} match service.lua
@@ -21,14 +21,21 @@
 UNAME_S   := $(shell uname -s)
 LUAJIT    ?= luajit
 
-# Install next to the luajit that will load the module: /opt/homebrew with
-# Homebrew on Apple Silicon, /usr/local for a source build on Linux.
+# Install prefix. On macOS always /usr/local: /opt/homebrew belongs to
+# Homebrew (user-owned, no sudo), and luajit searches /usr/local/share/lua/5.1
+# and /usr/local/lib/lua/5.1 before its own prefix. On Linux, next to the
+# luajit that will load the module (/usr/local for a source build).
 LUAJIT_BIN    := $(shell command -v $(LUAJIT) 2>/dev/null)
 LUAJIT_PREFIX := $(patsubst %/bin/,%,$(dir $(LUAJIT_BIN)))
 ifeq ($(strip $(LUAJIT_PREFIX)),)
 LUAJIT_PREFIX := /usr/local
 endif
-PREFIX    ?= $(LUAJIT_PREFIX)
+ifeq ($(UNAME_S),Darwin)
+DEFAULT_PREFIX := /usr/local
+else
+DEFAULT_PREFIX := $(LUAJIT_PREFIX)
+endif
+PREFIX    ?= $(DEFAULT_PREFIX)
 DESTDIR   ?=
 # Each platform needs its own SDK build (.so vs .framework).
 ifeq ($(UNAME_S),Darwin)

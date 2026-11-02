@@ -166,7 +166,8 @@ libuv、LuaJIT 2.1（同时用于构建期代码生成），以及 `lib/` 下的
 make                              # 默认 SDK：Linux ctp-6.7.10，macOS ctp-6.7.13-macos
 make CTP_VER=ctp-6.7.11           # 使用 lib/ 下的其他 SDK
 make test                         # C 测试、生成器测试、Lua 离线测试
-make install                      # 装到 PATH 里 luajit 所在前缀（Homebrew 为 /opt/homebrew），需要时加 sudo
+sudo make install                 # macOS 装到 /usr/local；Linux 装到 PATH 里 luajit 所在前缀
+make uninstall PREFIX=...         # 按同一前缀卸载
 make help                         # 全部目标和变量，含 PLATFORM
 ```
 
