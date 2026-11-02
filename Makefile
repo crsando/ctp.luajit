@@ -414,6 +414,7 @@ test-lua: all
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/order_rules_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/collector_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) examples/tradelog/clean_test.lua
+	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) examples/watcher/tick_rules_test.lua
 	python3 examples/tradelog/import_test.py
 
 # ASan/UBSan: overflows and leaked blocks fail the test too.

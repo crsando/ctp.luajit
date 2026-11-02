@@ -28,20 +28,13 @@ function S.boot(profile)
 
     service.spawn { name = "db_writer", source = "@db_writer.lua", config = {} }
 
+    -- 过滤、每 100ms 打包一批转发给 db_writer，见 collector.lua
     service.spawn {
         name = "collector",
-        source = [[
-            local service = require "service"
-            local ctp = require "ctp"
-            local S = require "ctp.templates.collector"
-            function S.on_tick(tick)
-                service.log.debug("on_tick | %s | %f", tick.InstrumentID, tick.LastPrice)
-                service.send("db_writer", "on_tick", tick)
-            end
-            return S
-        ]],
+        source = "@collector.lua",
         config = {
-            server = accounts["collector"][profile]
+            server = accounts["collector"][profile],
+            writer = "db_writer",
         },
         mailbox_size = 8096,
     }
@@ -58,7 +51,18 @@ function S.start_all()
     service.call("collector", "start")
     service.call("trader", "start")
 
-    local instruments = service.call("trader", "query_instrument")
+    local instruments, err = service.call("trader", "query_instrument")
+    if not instruments then
+        -- 周末、节假日定时启动时前置不开放
+        service.log.error("watcher | query_instrument failed: %s", tostring(err))
+        return
+    end
+
+    local exchanges = {}
+    for _, entry in ipairs(instruments) do
+        exchanges[entry.InstrumentID] = entry.ExchangeID
+    end
+    service.call("collector", "set_exchanges", exchanges)
 
     do
         local subs = {}
@@ -87,6 +91,9 @@ end
 
 function S.quit()
     service.log.debug("root is quiting")
+    -- 先停 collector：它把攒着的 tick 和日表发给 db_writer 之后才返回，
+    -- db_writer 再收到 quit，最后一次 flush 能带上这些数据
+    service.call("collector", "stop")
     service.send("db_writer", "quit")
     service.send("collector", "quit")
     service.send("trader", "quit")

@@ -5,6 +5,7 @@
 --   S.subscribe(symbols)       记入订阅集合；已登录时立即订阅，否则登录后再订阅
 --   S.unsubscribe(symbols)
 --   S.status()                 状态、重连次数、最近一次错误等
+--   S.trading_day()            最近一次登录返回的交易日（YYYYMMDD），未登录时为 nil
 --   S.on_tick(tick)            每个 tick 调用一次，由使用者覆盖
 --
 -- 启动成功之后的断线由 CTP 自动重连、libctpc 自动重新登录，登录后按订阅集合
@@ -36,6 +37,7 @@ local status = {
     reconnects = 0,   -- 启动成功后重新登录的次数
     last_error = nil,
     tick_errors = 0,  -- S.on_tick 抛错的次数
+    trading_day = nil, -- 最近一次登录返回的 TradingDay
 }
 
 local pending_start = nil -- { session, timer, done }
@@ -149,6 +151,8 @@ function E.OnRspUserLogin(rsp)
     else
         service.log.info("collector | logged in")
     end
+    local day = rsp.field and rsp.field.TradingDay
+    if day and day ~= "" then status.trading_day = day end
     set_state("ready")
     resubscribe()
     if pending_start then
@@ -292,7 +296,13 @@ function S.status()
         subscriptions = n,
         ticks_dropped = collector:ticks_dropped(),
         tick_errors = status.tick_errors,
+        trading_day = status.trading_day,
     }
+end
+
+-- 夜盘登录返回的是下一个交易日；郑商所 tick 里的 TradingDay 夜盘填自然日，以这个为准
+function S.trading_day()
+    return status.trading_day
 end
 
 function S.get_quotes()

@@ -83,7 +83,9 @@ do
     local co2, results2 = spawn()
     t.eq(select(2, results2()), "already starting", "concurrent start")
 
-    feed({ "OnFrontConnected" }, { "OnRspUserLogin", 0, {} })
+    feed({ "OnFrontConnected" }, { "OnRspUserLogin", 0, { TradingDay = "20261103" } })
+    t.eq(S.trading_day(), "20261103", "trading day from login")
+    t.eq(S.status().trading_day, "20261103", "trading day in status")
     t.eq(coroutine.status(co), "dead", "start returns after login")
     t.eq(results(), true, "start succeeds")
     t.eq(take_calls(), "start; subscribe rb2601,sc2701", "subscribed after login")
@@ -120,6 +122,7 @@ do
 
     feed({ "OnFrontConnected" }, { "OnRspUserLogin", 0, {} })
     t.eq(take_calls(), "subscribe ag2612,rb2601", "resubscribed after reconnect")
+    t.eq(S.trading_day(), "20261103", "login without a trading day keeps the last one")
     local st = S.status()
     t.eq(st.state, "ready", "ready after reconnect")
     t.eq(st.reconnects, 1, "reconnect counted")
