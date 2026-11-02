@@ -1,166 +1,140 @@
--- questdb.luajit is kept as a source dependency in ~/src.
+-- 把 collector 转发的 tick 写入 QuestDB，设计说明见 db_writer.md。
+-- 建表语句在 ctp_md_buffer.sql，需在第一次写入前执行。
 local qdb = require "questdb"
 local service = require "service"
+
 local config = service.config or {}
-
-local TABLE_NAME = "ctp_tmp"
 local QUESTDB_CONF = config.questdb_conf or "http::addr=192.168.5.13:9000;"
-local FLUSH_INTERVAL_MS = 1000
+local TABLE = config.table or "ctp_md_buffer"
+local BATCH_SIZE = config.batch_size or 1000
+local FLUSH_INTERVAL_MS = config.flush_interval_ms or 1000
 
-local sender, sender_err = qdb.sender { conf = QUESTDB_CONF }
-assert(sender, "failed to connect to QuestDB: " .. tostring(sender_err))
+-- { 列名, CTP 字段名 }
+local DOUBLE_COLUMNS = {
+    { "last_price", "LastPrice" },
+    { "turnover", "Turnover" },
+    { "open_interest", "OpenInterest" },
+    { "average_price", "AveragePrice" },
+    { "open_price", "OpenPrice" },
+    { "highest_price", "HighestPrice" },
+    { "lowest_price", "LowestPrice" },
+    { "close_price", "ClosePrice" },
+    { "settlement_price", "SettlementPrice" },
+    { "pre_settlement_price", "PreSettlementPrice" },
+    { "pre_close_price", "PreClosePrice" },
+    { "pre_open_interest", "PreOpenInterest" },
+    { "upper_limit_price", "UpperLimitPrice" },
+    { "lower_limit_price", "LowerLimitPrice" },
+}
 
-local function positive_integer(value, name, default)
-    if value == nil then
-        value = default
-    end
-    value = tonumber(value)
-    if not value or value ~= value or value == math.huge or value == -math.huge or
-        value < 1 or value % 1 ~= 0 then
-        error(name .. " must be a positive integer", 2)
+local LONG_COLUMNS = {
+    { "volume", "Volume" },
+    { "update_ms", "UpdateMillisec" },
+}
+
+for i = 1, 5 do
+    table.insert(DOUBLE_COLUMNS, { "bid_price" .. i, "BidPrice" .. i })
+    table.insert(DOUBLE_COLUMNS, { "ask_price" .. i, "AskPrice" .. i })
+    table.insert(LONG_COLUMNS, { "bid_volume" .. i, "BidVolume" .. i })
+    table.insert(LONG_COLUMNS, { "ask_volume" .. i, "AskVolume" .. i })
+end
+
+local SYMBOL_COLUMNS = {
+    { "symbol", "InstrumentID" },
+    { "exchange_id", "ExchangeID" },
+    { "trading_day", "TradingDay" },
+    { "action_day", "ActionDay" },
+}
+
+local sender = assert(qdb.sender { conf = QUESTDB_CONF })
+local buffer = assert(sender:buffer())
+local write_errors = 0
+
+-- CTP 用 DBL_MAX 表示没有值，写成 NaN，QuestDB 存为 NULL。
+local function ctp_double(value)
+    if value >= 1e300 then
+        return 0 / 0
     end
     return value
 end
 
-local BATCH_SIZE = positive_integer(config.batch_size, "config.batch_size", 1000)
-local buffer, buffer_err = sender:buffer()
-assert(buffer, "failed to create QuestDB buffer: " .. tostring(buffer_err))
-local pending_rows = 0
+-- 交易所时间：ActionDay 是自然日，CTP 时间是北京时间。
+local function exchange_time(tick)
+    local day = tick.ActionDay
+    return qdb.time.parse_rfc3339(string.format("%s-%s-%sT%s.%03d+08:00",
+        day:sub(1, 4), day:sub(5, 6), day:sub(7, 8), tick.UpdateTime, tick.UpdateMillisec))
+end
+
+local function write_row(tick, ts, received_at)
+    assert(buffer:table(TABLE))
+    for _, c in ipairs(SYMBOL_COLUMNS) do
+        local value = tick[c[2]]
+        if value ~= "" then
+            assert(buffer:symbol(c[1], value))
+        end
+    end
+    assert(buffer:string("update_time", tick.UpdateTime))
+    for _, c in ipairs(DOUBLE_COLUMNS) do
+        assert(buffer:double(c[1], ctp_double(tick[c[2]])))
+    end
+    for _, c in ipairs(LONG_COLUMNS) do
+        assert(buffer:int64(c[1], tick[c[2]]))
+    end
+    assert(buffer:timestamp("received_at", received_at))
+    assert(buffer:at(ts))
+end
+
+-- HTTP 传输在客户端内部已经重试过，仍然失败就丢掉这一批，内存不无限增长。
+local function flush()
+    local rows = buffer:row_count()
+    if rows == 0 then
+        return
+    end
+    local ok, err = buffer:flush()
+    if not ok then
+        service.log.error("db_writer | flush failed, %d rows dropped: %s", rows, tostring(err))
+        buffer:clear()
+    end
+end
+
+local flush_timer = service.uv.new_timer()
+flush_timer:start(FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, flush)
+
+local function log_write_error(tick, err)
+    write_errors = write_errors + 1
+    if write_errors == 1 or write_errors % 1000 == 0 then
+        service.log.error("db_writer | write %s failed (%d times): %s",
+            tostring(tick.InstrumentID), write_errors, tostring(err))
+    end
+end
 
 local S = {}
 
-local function required_string(value, name)
-    if type(value) ~= "string" or value == "" then
-        error(name .. " must be a non-empty string", 3)
-    end
-    return value
-end
-
-local function required_number(value, name)
-    value = tonumber(value)
-    if not value or value ~= value or value == math.huge or value == -math.huge then
-        error(name .. " must be a finite number", 3)
-    end
-    return value
-end
-
--- CTP's ActionDay is the natural calendar date. TradingDay is intentionally
--- not used because it can differ from the date on which the quote arrived.
-local function tick_timestamp(tick)
-    local action_day = required_string(tick.ActionDay, "tick.ActionDay")
-    local year, month, day = action_day:match("^(%d%d%d%d)(%d%d)(%d%d)$")
-    if not year then
-        year, month, day = action_day:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
-    end
-    if not year then
-        error("tick.ActionDay must be YYYYMMDD or YYYY-MM-DD", 3)
-    end
-
-    local update_time = required_string(tick.UpdateTime, "tick.UpdateTime")
-    local hour, minute, second = update_time:match("^(%d%d):(%d%d):(%d%d)$")
-    if not hour then
-        error("tick.UpdateTime must be HH:MM:SS", 3)
-    end
-
-    -- UpdateMillisec is the name in CThostFtdcDepthMarketDataField. Some
-    -- adapters expose the same value as Milliseconds, so accept both.
-    local milliseconds = tick.Milliseconds
-    if milliseconds == nil then
-        milliseconds = tick.UpdateMillisec
-    end
-    milliseconds = required_number(milliseconds, "tick.Milliseconds")
-    if milliseconds % 1 ~= 0 or milliseconds < 0 or milliseconds > 999 then
-        error("tick.Milliseconds must be an integer between 0 and 999", 3)
-    end
-
-    -- CTP timestamps are local China time. Parsing the explicit +08:00 offset
-    -- keeps the stored epoch value independent of the process's local TZ.
-    local text = string.format(
-        "%s-%s-%sT%s:%s:%s.%03d+08:00",
-        year, month, day, hour, minute, second, milliseconds)
-    return qdb.time.parse_rfc3339(text)
-end
-
-local function check(ok, err)
+function S.on_tick(tick)
+    local received_at = qdb.time.now_ns()
+    local ok, ts = pcall(exchange_time, tick)
     if not ok then
-        error("QuestDB write failed: " .. tostring(err), 3)
+        log_write_error(tick, ts) -- 还没开始写这一行，跳过即可
+        return
     end
-    return ok
-end
-
-local function flush_buffer()
-    local ok, err = buffer:flush()
-    if ok then
-        pending_rows = 0
-    end
-    return ok, err
-end
-
-local function append_tick(tick)
-    if type(tick) ~= "table" then
-        error("tick must be a table", 2)
-    end
-
-    local symbol = required_string(tick.InstrumentID, "tick.InstrumentID")
-    local price = required_number(tick.LastPrice, "tick.LastPrice")
-    local volume = tick.Volume
-    if volume == nil then
-        error("tick.Volume is required", 2)
-    end
-
-    local timestamp = tick_timestamp(tick)
-    local row, err = buffer:row(TABLE_NAME)
-    if not row then
-        error("QuestDB row creation failed: " .. tostring(err), 2)
-    end
-
-    check(row:symbol("symbol", symbol))
-    check(row:double("price", price))
-    check(row:int64("volume", volume))
-    check(row:at(timestamp))
-
-    pending_rows = pending_rows + 1
-    if pending_rows >= BATCH_SIZE then
-        check(flush_buffer())
-    end
-    return true
-end
-
-local function on_flush_timer()
-    local ok, err = flush_buffer()
+    local ok, err = pcall(write_row, tick, ts, received_at)
     if not ok then
-        io.stderr:write("QuestDB timed flush failed: " .. tostring(err) .. "\n")
+        -- buffer 无法撤销写了一半的行，只能清空这一批，否则后面每一行都会失败。
+        log_write_error(tick, err)
+        buffer:clear()
+        return
+    end
+    if buffer:row_count() >= BATCH_SIZE then
+        flush()
     end
 end
-
-local flush_timer, timer_err = service.uv.new_timer()
-assert(flush_timer, "failed to create QuestDB flush timer: " .. tostring(timer_err))
-local timer_ok, timer_start_err = flush_timer:start(
-    FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, on_flush_timer)
-assert(timer_ok, "failed to start QuestDB flush timer: " .. tostring(timer_start_err))
-
--- The collector currently sends the on_tick message. Keep that entry point
--- and expose S.tick as well for callers using the shorter function name.
-function S.tick(tick)
-    return append_tick(tick)
-end
-
-S.on_tick = S.tick
 
 function S.quit()
-    if flush_timer then
-        flush_timer:stop()
-        flush_timer:close()
-        flush_timer = nil
-    end
-
-    local ok, err = flush_buffer()
+    flush_timer:stop()
+    flush_timer:close()
+    flush()
     sender:close()
     service.quit()
-    if not ok then
-        error("QuestDB write failed during shutdown: " .. tostring(err), 2)
-    end
-    return true
 end
 
 return service.dispatch(S)

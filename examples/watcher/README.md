@@ -31,7 +31,7 @@ entry.lua                          根 service（service.root）
 | 路径 | 作用 |
 | --- | --- |
 | [`entry.lua`](entry.lua) | 入口脚本兼根 service，可选传入账户组名；编排子 service 的生命周期、定时启停和订阅流程 |
-| [`db_writer.lua`](db_writer.lua) | 校验 tick 并写入 QuestDB 表 `ctp_tmp` |
+| [`db_writer.lua`](db_writer.lua) | 将 tick 写入 QuestDB 表 `ctp_md_buffer`，设计见 [`db_writer.md`](db_writer.md) |
 | [`lua/ctp/templates/collector.lua`](../../lua/ctp/templates/collector.lua) | 连接 CTP 行情前置、订阅/取消订阅、转发 tick |
 | [`lua/ctp/templates/trader.lua`](../../lua/ctp/templates/trader.lua) | 交易前置、查询请求队列和订单状态管理 |
 | `*.con` | CTP 运行时配套的状态/配置文件，需与所用 CTP SDK 保持一致 |
@@ -117,20 +117,14 @@ CTP 柜台提供。不要将真实账户文件提交到 Git，也不要把密码
 
 ## QuestDB
 
-`db_writer` 使用 `questdb.luajit` 的行式写入接口，固定写入表名 `ctp_tmp`，
-每行包含以下字段：
+`db_writer` 使用 `questdb.luajit` 的行式写入接口，把完整的行情快照写入表
+`ctp_md_buffer`：原始日期/时间字段、本机接收时间 `received_at`、价格、成交量、
+持仓量和五档盘口。第一次运行前先在 QuestDB 执行
+[`ctp_md_buffer.sql`](ctp_md_buffer.sql) 建表。
 
-| 列名 | 类型 | 来源 |
-| --- | --- | --- |
-| `symbol` | SYMBOL | `tick.InstrumentID` |
-| `price` | DOUBLE | `tick.LastPrice` |
-| `volume` | LONG | `tick.Volume` |
-| 时间戳 | TIMESTAMP | `ActionDay` + `UpdateTime` + 毫秒 |
-
-时间戳按 CTP 的中国标准时间（`+08:00`）解析，日期优先使用
-`ActionDay`，而不是 `TradingDay`。`ActionDay` 接受 `YYYYMMDD` 或
-`YYYY-MM-DD`，`UpdateTime` 必须是 `HH:MM:SS`，毫秒字段支持
-`Milliseconds` 和 `UpdateMillisec`。
+指定时间戳 `ts` 由 `ActionDay` + `UpdateTime` + `UpdateMillisec` 按
+`+08:00` 解析。列定义、无效值处理和错误处理策略见
+[`db_writer.md`](db_writer.md)。旧表 `ctp_tmp` 不再写入。
 
 默认连接字符串为：
 
@@ -234,7 +228,7 @@ SERVICE_LOG_LEVEL=debug luajit entry.lua
 - `start_all` 目前不检查 `start` 和 `query_instrument` 的返回值。前置未开放（周末、节假日的定时启动）
   导致查询失败时，`query_instrument` 返回 `nil`，后续遍历会报错。
 - 根 service 会根据交易查询结果订阅全部期货合约，可能产生较大的行情量和数据库写入压力。
-- `db_writer` 会严格校验 `InstrumentID`、`LastPrice`、`Volume` 和时间字段，字段缺失或格式错误会抛出异常。
+- `db_writer` 不逐字段校验 tick。时间字段解析失败的 tick 被跳过；一行写到一半失败时会清空当前批次（最多 `batch_size` 条或 1 秒的数据）；flush 失败时丢弃该批。这些情况都会记录错误日志。
 - libctpc 默认会改造 CTP 库的输出：CTP 自身的打印并入日志（`[ctp]` 前缀），采集终端信息时
   `lshw` / `dmidecode` 的报错被丢弃。这只是隐藏报错：非 root 运行或未装 dmidecode 时，
   上报的终端信息仍不完整。详见根目录 [README](../../README.md) 的特别提示。
