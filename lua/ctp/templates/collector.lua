@@ -18,9 +18,6 @@ local config = service.config; do
         config.auto_disconnect = true
     end
 
--- CTP 的错误信息是 GBK；用 iconv.lua 转换，不可用时原样保留（见 ctp.gbk）
-local to_utf8 = require("ctp.gbk").to_utf8
-
 local DEFAULT_START_TIMEOUT_MS = 10000
 local SUBSCRIBE_BATCH = 100
 
@@ -59,7 +56,7 @@ end
 local function rsp_error(rsp)
     local info = rsp.rsp_info
     if info and info.ErrorID ~= 0 then
-        return string.format("%d %s", info.ErrorID, to_utf8(info.ErrorMsg))
+        return string.format("%d %s", info.ErrorID, info.ErrorMsg)
     end
     return nil
 end

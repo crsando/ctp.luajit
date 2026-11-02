@@ -134,7 +134,7 @@ macOS 没有 `malloc.h`（`malloc` 声明在 `stdlib.h`）。`stdlib.h` 已经 i
 | `ffi.load(LIBDIR .. "/libctpc.so")` | **改成按平台选扩展名**：`jutil.os()` 或 `ffi.os`（`"OSX"` / `"Linux"`）→ `.so` / `.dylib`。或者干脆 `ffi.load(LIBDIR .. "/libctpc")`，让 LuaJIT 自己补后缀（LuaJIT 在 Darwin 上会尝试 `.dylib`）——后者更简洁，推荐 |
 | `libthost*_se.so` 名字 | 只出现在 C 侧 `ctp_stdio.c` 的 `ctp_libraries[]`，Lua 不关心 |
 | `uv_async_send(md->async)` / `luv` | libuv 是跨平台的，`uv_async_send` 语义一样（macOS 上底层是 kqueue + pipe），**不用改** |
-| `iconv`（GBK → UTF-8） | 用本项目的 `iconv.lua`（POSIX `iconv(3)` 绑定，同时支持 Linux/macOS）。macOS 上它必须链接 `-liconv`，否则 `require` 报 `symbol not found in flat namespace '_iconv'`；Makefile 已在 Darwin 上自动加。统一由 `ctp.gbk` 调用，读不到时原样返回 |
+| `iconv`（GBK → UTF-8） | `ctp.gbk` 用 FFI 直接调 POSIX `iconv(3)`：Linux 在 glibc（`ffi.C`），macOS 在 `libiconv.dylib`（`ffi.load("iconv")`，不在 `libSystem`）。在 `cast_rsp` 统一转换，打不开时原样返回 |
 | `os.date`/`os.time` | 无差异 |
 
 ### 2.7 `tools/gen.lua` —— 要处理多个 SDK 版本/平台

@@ -9,6 +9,7 @@
 -- The C side logs through the logger shared with service.lua; see
 -- docs/logging.md.
 local ffi = require "ffi"
+local to_utf8 = require("ctp.gbk").to_utf8
 
 local function find_libdir()
     local dir = os.getenv("CTPC_LIBDIR")
@@ -63,16 +64,33 @@ end
 --
 -- struct layouts, from the generated cdefs.lua
 --
-local layouts = {} -- struct name -> { list = { { field, kind, size }, ... }, by_name = { ... } }
+local layouts = {} -- struct name -> { list = { { field, kind, size }, ... }, by_name = { ... }, text = { ... } }
+
+-- String fields that CTP fills with GBK text (names, messages, memos); every
+-- other string field is an ID, code, date or address. Decided by field name,
+-- once per struct, so a tick (no such fields) costs nothing.
+local TEXT_SUFFIXES = { "Name$", "Msg$", "Content$", "Memo$", "Remark$" }
+local TEXT_FIELDS = { Message = true, RetInfo = true, UserEventInfo = true }
+
+local function is_text_field(field)
+    if TEXT_FIELDS[field] then return true end
+    for _, p in ipairs(TEXT_SUFFIXES) do
+        if field:find(p) then return true end
+    end
+    return false
+end
 
 local function layout(name)
     local l = layouts[name]
     if l == nil then
         local fields = cdefs.structs[name]
         if not fields then return nil end
-        l = { list = fields, by_name = {} }
+        l = { list = fields, by_name = {}, text = {} }
         for _, f in ipairs(fields) do
             l.by_name[f[1]] = f
+            if f[2] == "string" and is_text_field(f[1]) then
+                l.text[#l.text + 1] = f[1]
+            end
         end
         layouts[name] = l
     end
@@ -101,8 +119,9 @@ local function pointer_type(name)
 end
 
 -- Copy the struct p of type name into a Lua table: strings as strings, char
--- fields as their byte value, numbers as numbers.
-local function totable(p, name)
+-- fields as their byte value, numbers as numbers. With utf8, the GBK text
+-- fields (see is_text_field) are converted to UTF-8.
+local function totable(p, name, utf8)
     local l = layout(name)
     if not l then return nil end
     local o = {}
@@ -112,6 +131,11 @@ local function totable(p, name)
             o[k] = ffi.string(p[k])
         else
             o[k] = tonumber(p[k])
+        end
+    end
+    if utf8 then
+        for _, k in ipairs(l.text) do
+            o[k] = to_utf8(o[k])
         end
     end
     return o
@@ -155,9 +179,10 @@ function M.new_struct(name, t)
     return p
 end
 
--- A Lua table copy of p, a struct of type name or a pointer to one.
-function M.totable(p, name)
-    return totable(p, name)
+-- A Lua table copy of p, a struct of type name or a pointer to one. Strings
+-- are the raw bytes; pass utf8 = true to convert the GBK text fields.
+function M.totable(p, name, utf8)
+    return totable(p, name, utf8)
 end
 
 -- Check a string bound for a fixed-size char array of a libctpc struct.
@@ -181,7 +206,9 @@ local function check_front_addr(s, value, label)
 end
 
 -- A ctp_rsp_t as a Lua table: func_name, field_name, req_id, is_last, and
--- field / rsp_info converted with totable.
+-- field / rsp_info converted with totable. This is the one place CTP text
+-- turns into UTF-8: everything above it (templates, examples) only sees
+-- UTF-8 in ErrorMsg, StatusMsg, InstrumentName and the other text fields.
 local function cast_rsp(rsp)
     if rsp == nil then return nil end
     local rst = {}
@@ -189,10 +216,10 @@ local function cast_rsp(rsp)
     rst.field_name = ffi.string(rsp.field_name)
     rst.func_name = ffi.string(rsp.func_name)
     if rsp.field ~= nil and layout(rst.field_name) then
-        rst.field = totable(ffi.cast(pointer_type(rst.field_name), rsp.field), rst.field_name)
+        rst.field = totable(ffi.cast(pointer_type(rst.field_name), rsp.field), rst.field_name, true)
     end
     if rsp.rsp_info ~= nil then
-        rst.rsp_info = totable(ffi.cast(pointer_type("CThostFtdcRspInfoField"), rsp.rsp_info), "CThostFtdcRspInfoField")
+        rst.rsp_info = totable(ffi.cast(pointer_type("CThostFtdcRspInfoField"), rsp.rsp_info), "CThostFtdcRspInfoField", true)
     end
     rst.is_last = rsp.is_last
     return rst

@@ -99,7 +99,7 @@ void CustomMdSpi::OnRspUserLogin(
 		log_debug("OnRspUserLogin | Success | BrokerID:%s | UserID:%s", this->_md->broker, this->_md->user);
 	}
 	else
-		log_error("OnRspUserLogin | Fail | ErrorID:%d | %s", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspUserLogin | Fail | ErrorID:%d", pRspInfo->ErrorID);
 	send_md(this->_md, "OnRspUserLogin", "CThostFtdcRspUserLoginField", CTPC_RSP_EVENT,
 		nRequestID, bIsLast, pRspUserLogin, sizeof(CThostFtdcRspUserLoginField), pRspInfo);
 }
@@ -123,7 +123,7 @@ void CustomMdSpi::OnRspUserLogout(
 void CustomMdSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
 {
 	if (is_error(pRspInfo))
-		log_error("OnRspError | ErrorID:%d | ErrorMsg:%s", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspError | ErrorID:%d", pRspInfo->ErrorID);
 	send_md(this->_md, "OnRspError", "", CTPC_RSP_EVENT, nRequestID, bIsLast, NULL, 0, pRspInfo);
 }
 
@@ -136,7 +136,7 @@ void CustomMdSpi::OnRspSubMarketData(
 {
 	const char * symbol = pSpecificInstrument ? pSpecificInstrument->InstrumentID : "";
 	if (is_error(pRspInfo))
-		log_error("OnRspSubMarketData | %s | ErrorID:%d | ErrorMsg:%s", symbol, pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspSubMarketData | %s | ErrorID:%d", symbol, pRspInfo->ErrorID);
 	else
 		log_debug("OnRspSubMarketData | %s", symbol);
 	send_md(this->_md, "OnRspSubMarketData", "CThostFtdcSpecificInstrumentField", CTPC_RSP_EVENT,
@@ -152,7 +152,7 @@ void CustomMdSpi::OnRspUnSubMarketData(
 {
 	const char * symbol = pSpecificInstrument ? pSpecificInstrument->InstrumentID : "";
 	if (is_error(pRspInfo))
-		log_error("OnRspUnSubMarketData | %s | ErrorID:%d | ErrorMsg:%s", symbol, pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspUnSubMarketData | %s | ErrorID:%d", symbol, pRspInfo->ErrorID);
 	else
 		log_debug("OnRspUnSubMarketData | %s", symbol);
 	send_md(this->_md, "OnRspUnSubMarketData", "CThostFtdcSpecificInstrumentField", CTPC_RSP_EVENT,

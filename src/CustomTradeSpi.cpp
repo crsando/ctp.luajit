@@ -79,7 +79,7 @@ void CustomTradeSpi::OnRspAuthenticate(CThostFtdcRspAuthenticateField *pRspAuthe
 		set_state(this->_trader, CTPC_TRADER_AUTHENTICATED);
 	}
 	else
-		log_error("OnRspAuthenticate | Fail | AppID:%s | %d | %s", this->_trader->app_id, pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspAuthenticate | Fail | AppID:%s | ErrorID:%d", this->_trader->app_id, pRspInfo->ErrorID);
 	ON_RSP_THEN_SEND_FIELD(OnRspAuthenticate, CThostFtdcRspAuthenticateField, pRspAuthenticateField);
 	if (ok)
 		check_sent(this->_trader, "OnRspUserLogin", "ReqUserLogin", reqUserLogin());
@@ -106,7 +106,7 @@ void CustomTradeSpi::OnRspUserLogin(
 		set_state(this->_trader, CTPC_TRADER_LOGGED_IN);
 	}
 	else if (pRspInfo != NULL)
-		log_error("OnRspUserLogin | Fail | BrokerID:%s | UserID:%s | %d | %s", this->_trader->broker, this->_trader->user, pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspUserLogin | Fail | BrokerID:%s | UserID:%s | ErrorID:%d", this->_trader->broker, this->_trader->user, pRspInfo->ErrorID);
 	ON_RSP_THEN_SEND_FIELD(OnRspUserLogin, CThostFtdcRspUserLoginField, pRspUserLogin);
 
 	// 投资者结算结果确认
@@ -117,7 +117,7 @@ void CustomTradeSpi::OnRspUserLogin(
 void CustomTradeSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
 {
 	if (pRspInfo)
-		log_error("OnRspError | %d | %s", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspError | ErrorID:%d", pRspInfo->ErrorID);
 	send_rsp(this->_trader, "OnRspError", "", nRequestID, bIsLast, NULL, 0, pRspInfo);
 }
 
@@ -163,7 +163,7 @@ void CustomTradeSpi::OnHeartBeatWarning(int nTimeLapse)
 void CustomTradeSpi::fn (tp * pField, CThostFtdcRspInfoField * pRspInfo, int nRequestID, bool bIsLast)  { \
     log_debug("%s | nRequestID : %d | isLast: %d", #fn, nRequestID, bIsLast ? 1 : 0); \
 	if(pRspInfo && (pRspInfo->ErrorID != 0)) { \
-		log_warn("%s | ErrorRsp | %d | %s", #fn, pRspInfo->ErrorID, pRspInfo->ErrorMsg); \
+		log_warn("%s | ErrorRsp | ErrorID:%d", #fn, pRspInfo->ErrorID); \
     } \
     ON_RSP_THEN_SEND(fn, tp); \
 }
@@ -180,7 +180,7 @@ void CustomTradeSpi::OnRspSettlementInfoConfirm(
 			pField ? pField->ConfirmDate : "", pField ? pField->ConfirmTime : "");
 	}
 	else {
-		log_error("OnRspSettlementInfoConfirm | Failed | %d | %s", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_error("OnRspSettlementInfoConfirm | Failed | ErrorID:%d", pRspInfo->ErrorID);
 	}
 
     ON_RSP_THEN_SEND(OnRspSettlementInfoConfirm, CThostFtdcSettlementInfoConfirmField);
@@ -342,7 +342,6 @@ void CustomTradeSpi::OnRspUserPasswordUpdate(
         // 改密失败
         std::cerr << "=== 密码修改失败 ===" << std::endl;
         std::cerr << "ErrorID: " << pRspInfo->ErrorID << std::endl;
-        std::cerr << "ErrorMsg: " << pRspInfo->ErrorMsg << std::endl;
 
         switch (pRspInfo->ErrorID) {
         case 3:
@@ -371,7 +370,7 @@ bool CustomTradeSpi::isErrorRspInfo(CThostFtdcRspInfoField *pRspInfo)
 {
 	bool bResult = pRspInfo && (pRspInfo->ErrorID != 0);
 	if (bResult)
-		log_debug("isErrorRspInfo | %d | %s", pRspInfo->ErrorID, pRspInfo->ErrorMsg);
+		log_debug("isErrorRspInfo | ErrorID:%d", pRspInfo->ErrorID);
 	return bResult;
 }
 

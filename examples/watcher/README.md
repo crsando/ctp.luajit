@@ -44,7 +44,7 @@ entry.lua                          根 service（service.root）
 - `service` 及其 `service_c` 原生模块；
 - 本仓库的 Lua 模块 `ctp`，以及 `libctpc.so`、生成的 `cdefs.lua` 和 CTP API 动态库；
 - `questdb.luajit` 及其底层 `libquestdb_client`；
-- Lua 模块 `inspect`、`iconv`、`cjson.safe` 和 `luv`；
+- Lua 模块 `inspect`、`cjson.safe` 和 `luv`（GBK 转码用系统 iconv，不需要额外模块）；
 - 可访问的 CTP 行情/交易前置；
 - 可写入的 QuestDB 实例。
 

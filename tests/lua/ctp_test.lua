@@ -47,6 +47,42 @@ do
     t.raises(function () ctp.new_struct("CThostFtdcNoSuchField") end, "unknown struct", "unknown struct")
 end
 
+-- GBK text: ctp.gbk through the system iconv, and totable(..., true) as
+-- cast_rsp uses it. "\196\227\186\195" is 你好 in GBK.
+do
+    local gbk = require "ctp.gbk"
+    t.eq(gbk.available, true, "iconv available")
+    t.eq(gbk.error, nil, "iconv no error")
+    t.eq(gbk.to_utf8("\196\227\186\195"), "你好", "gbk to utf8")
+    t.eq(gbk.to_utf8("rb2601"), "rb2601", "ascii unchanged")
+    t.eq(gbk.to_utf8(""), "", "empty unchanged")
+    t.eq(gbk.to_utf8(nil), nil, "nil unchanged")
+    t.eq(gbk.to_utf8("CTP:\196\227\186"), "CTP:你", "sequence cut at the end is dropped")
+    t.eq(gbk.to_utf8("\255\255x"), "\255\255x", "invalid input returned as is")
+    t.eq(gbk.to_utf8(string.rep("\196\227", 40)), string.rep("你", 40), "long string")
+
+    local p = ctp.new_struct("CThostFtdcOrderField", {
+        InstrumentID = "rb2601",
+        StatusMsg = "\196\227\186\195",
+        OrderMemo = "\196\227",
+        ExchangeInstID = "\196\227", -- not a text field: stays raw
+    })
+    local raw = ctp.totable(p, "CThostFtdcOrderField")
+    t.eq(raw.StatusMsg, "\196\227\186\195", "totable keeps raw bytes")
+    local o = ctp.totable(p, "CThostFtdcOrderField", true)
+    t.eq(o.StatusMsg, "你好", "StatusMsg converted")
+    t.eq(o.OrderMemo, "你", "OrderMemo converted")
+    t.eq(o.ExchangeInstID, "\196\227", "non-text field not converted")
+    t.eq(o.InstrumentID, "rb2601", "id unchanged")
+
+    local i = ctp.totable(ctp.new_struct("CThostFtdcRspInfoField",
+        { ErrorID = 31, ErrorMsg = "CTP:\196\227\186\195" }), "CThostFtdcRspInfoField", true)
+    t.eq(i.ErrorMsg, "CTP:你好", "ErrorMsg converted")
+    local n = ctp.totable(ctp.new_struct("CThostFtdcInstrumentField",
+        { InstrumentName = "\196\227\186\195" }), "CThostFtdcInstrumentField", true)
+    t.eq(n.InstrumentName, "你好", "InstrumentName converted")
+end
+
 -- new_trader checks the account strings before they reach strcpy
 do
     local server = { front_addr = "tcp://127.0.0.1:1", broker = "9999", user = "000001", pass = "secret" }

@@ -404,7 +404,8 @@ test-gen: $(TARGET)
 	echo "test-gen: $$got request wrappers ok"
 
 # Offline: loads libctpc from $(BUILD_DIR) but never connects. The
-# template test needs luv, inspect and iconv, as the template itself does.
+# template test needs luv and inspect, as the template itself does; GBK
+# conversion uses the system iconv through the FFI.
 test-lua: all
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/ctp_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_query_test.lua

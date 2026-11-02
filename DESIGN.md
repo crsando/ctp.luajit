@@ -93,9 +93,14 @@ lib/<CTP_VER>/                         CTP SDK
 - 源码只有两处平台分支：`ctpc.cpp` 的 flow 文件根目录（`$TMPDIR` / `/dev/shm`，可用
   `CTPC_FLOW_DIR` 覆盖）和 `ctp_stdio.c` 的 Mach-O 降级。
 - Lua 侧按 `ffi.os` 选 `libctpc.so` / `libctpc.dylib`。
-- GBK 转换统一走 `ctp.gbk`，底层是本项目的 `iconv.lua`（`iconv.open` +
-  `converter:convert`）。不需要 lua-iconv 兼容：加载不到时 `to_utf8` 原样返回，
-  `M.available` / `M.error` 说明原因。
+- GBK 转换统一在 `cast_rsp`（`lua/ctp/init.lua`）做一次：回报里的文本字段（字段名以
+  Name/Msg/Content/Memo/Remark 结尾，外加 Message、RetInfo、UserEventInfo）转成
+  UTF-8，模板和下游只看到 UTF-8；`ctp.totable` 默认仍返回原始字节。按结构体缓存
+  需要转换的字段，tick 没有这类字段，不增加开销。
+- 底层是 `ctp.gbk` 用 FFI 直接调系统 `iconv(3)`（Linux 在 glibc，macOS 在
+  `libiconv.dylib`），不需要额外安装模块。打不开时 `to_utf8` 原样返回，
+  `M.available` / `M.error` 说明原因；结尾被截断的半个汉字会被丢掉。
+- C 侧日志只打印 `ErrorID`，不打印 `ErrorMsg` 等 GBK 文本，错误文字由 Lua 侧记录。
 - macOS 需要 CTP 6.7.13+：之前的 mac 版 `ReqUserLogin` 比 Linux 多两个穿透式参数，
   生成器遇到会明确失败。下载、签名与验证见 [docs/macos-sdk.md](docs/macos-sdk.md)，
   完整清单见 [docs/platform-portability.md](docs/platform-portability.md)。
@@ -140,7 +145,7 @@ lib/<CTP_VER>/                         CTP SDK
 ### Lua 层与模板
 
 - `trader` 模板 `on_idle` 中处理函数出错会中断整轮消息处理；`collector` 的 `pcall` 吞掉错误不记日志。
-- 每个 tick 都 `totable` 全部字段；GBK 只在两处转换。
+- 每个 tick 都 `totable` 全部字段。✅ GBK 已统一在 `cast_rsp` 转换（原来只在两处）。
 - 模板仍在 require 时产生副作用，不能注入 fake trader（目前测试靠替换实例方法）。
 
 ### 应用层

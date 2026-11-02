@@ -328,5 +328,5 @@ universal）。**但 Homebrew 的 libuv 只有宿主架构**，所以会因为�
 | --- | --- |
 | `uv_async_send` / `msgq`（pthread mutex + cond） | libuv 和 POSIX 都是跨平台的，语义一致 |
 | `__atomic_*` 内建 | Apple clang 支持 |
-| `iconv` | 用项目自己的 `iconv.lua`；macOS 必须链 `-liconv`（在 `libiconv.dylib`，不在 `libSystem`） |
+| `iconv` | `ctp.gbk` 用 FFI 调系统 iconv：macOS 上 `ffi.load("iconv")`（在 `libiconv.dylib`，不在 `libSystem`） |
 | `-Werror` 构建 | 通过；`src/log.c` 是 service.lua 的逐字副本，`-Wformat-nonliteral` / `-Wstrncat-size` 按文件单独抑制 |
