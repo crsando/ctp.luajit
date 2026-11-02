@@ -10,7 +10,7 @@ CTP，查询可用期货合约，订阅行情，并将每个 tick 写入 QuestDB
 ## 数据流
 
 ```text
-run.lua -> entry.lua
+entry.lua                          根 service（service.root）
     |-- ctp.templates.trader      连接交易前置，查询合约
     |-- ctp.templates.collector   连接行情前置，接收 tick
     `-- db_writer.lua                  将 tick 写入 QuestDB
@@ -18,7 +18,9 @@ run.lua -> entry.lua
 
 根 service 的启动流程如下：
 
-1. 读取 `~/.ctp.luajit/accounts.lua`。
+1. 确定账户组名（命令行参数 > `service.config.profile` > 默认 `gtja-3`），
+   从 `~/.ctp.luajit/accounts.lua` 读取对应的 collector 和 trader 配置；
+   任一缺失则报错退出（退出码 1）。
 2. 启动 `db_writer`、`collector` 和 `trader`。
 3. 等待交易 service 建立连接并查询期货合约。
 4. 每 10 个合约一批调用行情 service 的 `subscribe`。
@@ -28,8 +30,7 @@ run.lua -> entry.lua
 
 | 路径 | 作用 |
 | --- | --- |
-| [`run.lua`](run.lua) | 启动根 service，可选传入账户组名 |
-| [`entry.lua`](entry.lua) | 根 service，编排子 service 的生命周期和订阅流程 |
+| [`entry.lua`](entry.lua) | 入口脚本兼根 service，可选传入账户组名；编排子 service 的生命周期、定时启停和订阅流程 |
 | [`db_writer.lua`](db_writer.lua) | 校验 tick 并写入 QuestDB 表 `ctp_tmp` |
 | [`lua/ctp/templates/collector.lua`](../../lua/ctp/templates/collector.lua) | 连接 CTP 行情前置、订阅/取消订阅、转发 tick |
 | [`lua/ctp/templates/trader.lua`](../../lua/ctp/templates/trader.lua) | 交易前置、查询请求队列和订单状态管理 |
@@ -85,8 +86,8 @@ make install
 $HOME/.ctp.luajit/accounts.lua
 ```
 
-Windows 环境会尝试使用 `USERPROFILE`。该文件必须返回一个 Lua table，并包含
-`collector.gtja-3` 和 `trader.gtja-3` 两个默认配置。示例：
+Windows 环境会尝试使用 `USERPROFILE`。该文件必须返回一个 Lua table，且
+`collector` 和 `trader` 下都要有所用账户组名的配置（默认 `gtja-3`）。示例：
 
 ```lua
 -- ~/.ctp.luajit/accounts.lua
@@ -152,22 +153,29 @@ service.spawn {
 
 ## 启动
 
-确认账户、CTP 动态库和 QuestDB 均已就绪后，在项目根目录运行：
+确认账户、CTP 动态库和 QuestDB 均已就绪后，**在本目录**运行 `entry.lua`
+（`db_writer` 按相对路径 `@db_writer.lua` 加载，换目录启动会找不到）：
 
 ```bash
-cd /home/twando/src/ctp.luajit/examples/watcher
-luajit run.lua              # 使用默认账户组 gtja-3
-luajit run.lua my-profile   # 使用其他账户组
+cd ~/src/ctp.luajit/examples/watcher
+luajit entry.lua              # 使用默认账户组 gtja-3
+luajit entry.lua my-profile   # 使用其他账户组
 ```
+
+`entry.lua` 在顶层 `require "service.root"`，因此它本身就是可执行的入口，
+命令行第一个参数会传给 `boot(profile)`。
 
 `service` 和 `service_c` 需先安装到 LuaJIT 可搜索的位置。若 `ctp` 和
 `questdb.luajit` 的 Lua 模块没有安装到系统路径，可显式设置 `LUA_PATH`，
 并用 `CTPC_LIBDIR` 指向 `libctpc.so` 所在的构建目录：
 
 ```bash
-export LUA_PATH='/home/twando/src/ctp.luajit/lua/?.lua;/home/twando/src/ctp.luajit/lua/?/init.lua;/home/twando/src/questdb.luajit/lua/?.lua;/home/twando/src/questdb.luajit/lua/?/init.lua;;'
-export CTPC_LIBDIR=/home/twando/src/ctp.luajit/build/ctp-6.7.10
-luajit run.lua
+export LUA_PATH="$HOME/src/ctp.luajit/lua/?.lua;$HOME/src/ctp.luajit/lua/?/init.lua;$HOME/src/questdb.luajit/lua/?.lua;$HOME/src/questdb.luajit/lua/?/init.lua;;"
+# Linux
+export CTPC_LIBDIR=$HOME/src/ctp.luajit/build/ctp-6.7.10
+# macOS
+export CTPC_LIBDIR=$HOME/src/ctp.luajit/build/ctp-6.7.13-macos
+luajit entry.lua
 ```
 
 日志统一输出到 stderr，默认级别为 `info`。libctpc 的请求、回报等 C 侧日志以及
@@ -176,8 +184,19 @@ luajit run.lua
 [`docs/logging.md`](../../docs/logging.md)：
 
 ```bash
-SERVICE_LOG_LEVEL=debug luajit run.lua
+SERVICE_LOG_LEVEL=debug luajit entry.lua
 ```
+
+启动后根 service 会立即执行一次 `start_all`，之后按以下时间定时启停：
+
+| 时间 | 动作 |
+| --- | --- |
+| 08:45 | `start_all`（日盘） |
+| 15:45 | `stop_all` |
+| 20:45 | `start_all`（夜盘） |
+| 04:00 | `stop_all` |
+
+`start` 是幂等的：已经 ready 时再次调用直接返回，因此重复触发 `start_all` 无害。
 
 进程会一直运行以接收行情。退出时应通过 service 的退出流程停止；不要在有未完成
 订单时直接强制终止进程。
@@ -211,7 +230,9 @@ SERVICE_LOG_LEVEL=debug luajit run.lua
 
 ## 注意事项
 
-- 账户路径和默认 QuestDB 地址目前都写在代码约定中；账户组名可作为 `run.lua` 参数指定。
+- 账户路径和默认 QuestDB 地址目前都写在代码约定中；账户组名可作为 `entry.lua` 的命令行参数指定。
+- `start_all` 目前不检查 `start` 和 `query_instrument` 的返回值。前置未开放（周末、节假日的定时启动）
+  导致查询失败时，`query_instrument` 返回 `nil`，后续遍历会报错。
 - 根 service 会根据交易查询结果订阅全部期货合约，可能产生较大的行情量和数据库写入压力。
 - `db_writer` 会严格校验 `InstrumentID`、`LastPrice`、`Volume` 和时间字段，字段缺失或格式错误会抛出异常。
 - libctpc 默认会改造 CTP 库的输出：CTP 自身的打印并入日志（`[ctp]` 前缀），采集终端信息时

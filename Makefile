@@ -402,6 +402,7 @@ test-lua: all
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/ctp_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_query_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_start_test.lua
+	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/trader_order_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) tests/lua/collector_test.lua
 	$(TEST_ENV) CTPC_LIBDIR=$(BUILD_DIR) $(LUAJIT) examples/tradelog/clean_test.lua
 	python3 examples/tradelog/import_test.py

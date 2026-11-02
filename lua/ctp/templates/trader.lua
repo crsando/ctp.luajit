@@ -7,6 +7,9 @@
 --   S.status()                 状态、会话、重连次数、最近一次错误
 --   S.query_account() ...      查询，按 1 次/秒流控
 --   S.trade(...)               下单并等待结束
+--   S.nuke()                   市价平掉全部持仓
+--
+-- config.query_only = true 时 trade / nuke 直接返回错误，不发任何报单（默认 false）。
 --
 -- 启动成功之后的断线由 CTP 自动重连、libctpc 自动重走登录链路；断线时正在
 -- 执行的查询立即失败，排队中的查询等重新就绪后再发。
@@ -26,8 +29,8 @@ local config = service.config; do
         config.auto_disconnect = true
     end
 
--- read only: 只允许query, 禁止所有 order
-local _read_only = config.read_only or true
+-- query only: 只允许 query，trade / nuke 直接返回错误，不发任何报单；默认 false
+local QUERY_ONLY = config.query_only == true
 
 local function slice(t, k)
     if not t then return nil end
@@ -833,7 +836,10 @@ function service.on_idle()
 end
 
 -- Nuke Every Existing Positions
+-- query_only 时返回 nil, "query only"，不查持仓也不报单
 function S.nuke()
+    if QUERY_ONLY then return nil, "query only" end
+
     local rst = service.call(service.get_id(), "query_position")
 
     for _, entry in ipairs(rst) do 
@@ -850,8 +856,9 @@ function S.nuke()
     end
 end
 
+-- 返回 msg, entry（同 order:trade）；query_only 时返回 "query only", nil
 function S.trade(...)
-    -- if _read_only then return nil end
+    if QUERY_ONLY then return "query only", nil end
     return order:trade(...)
 end
 

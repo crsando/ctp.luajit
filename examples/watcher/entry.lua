@@ -18,8 +18,13 @@ do
 end
 
 
-function S.boot()
-    local profile = config.profile or "gtja-3"
+-- profile 依次取命令行参数、service.config.profile，默认 gtja-3
+function S.boot(profile)
+    profile = profile or config.profile or "gtja-3"
+    if not (accounts["collector"][profile] and accounts["trader"][profile]) then
+        return service.quit("no collector/trader account for profile: " .. profile)
+    end
+    service.log.info("watcher | profile %s", profile)
 
     service.spawn { name = "db_writer", source = "@db_writer.lua", config = {} }
 
