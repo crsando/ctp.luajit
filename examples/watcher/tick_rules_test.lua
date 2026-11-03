@@ -19,6 +19,17 @@ do
     t.eq(rules.exchange_ts_us("00:00:00", 500, 1793635199000000), 1793635200500000, "across midnight, early clock")
     -- 21:00 receives the 15:00 close snapshot: same day, 6 h old
     t.eq(rules.exchange_ts_us("15:00:00", 0, 1793624400000000), 1793602800000000, "old snapshot keeps its time")
+    -- 2026-11-03 12:10 restarts and receives last night's 20:59 auction snapshot: 2026-11-02, not tonight
+    t.eq(rules.exchange_ts_us("20:59:00", 0, 1793679000000000), 1793624340000000, "old night snapshot is yesterday")
+    -- 20:55 receives an 18:43 snapshot: same day, 2 h old
+    t.eq(rules.exchange_ts_us("18:43:16", 45, 1793710500000000), 1793702596045000, "old snapshot earlier today")
+    -- 08:50 receives the 02:30 SHFE close: same day
+    t.eq(rules.exchange_ts_us("02:30:00", 0, 1793667000000000), 1793644200000000, "night close after midnight")
+    -- local clock 5 min slow: still today; one second more is yesterday
+    t.eq(rules.exchange_ts_us("09:05:00", 0, 1793667600000000), 1793667900000000, "clock slow by CLOCK_SKEW")
+    t.eq(rules.exchange_ts_us("09:05:01", 0, 1793667600000000), 1793581501000000, "beyond CLOCK_SKEW is yesterday")
+    -- 2026-11-03 23:58 (clock 5 min slow) receives 00:03: the day after
+    t.eq(rules.exchange_ts_us("00:03:00", 0, 1793721480000000), 1793721780000000, "slow clock across midnight")
 
     t.eq(rules.exchange_ts_us("9:00:00", 0, now), nil, "bad time format")
     t.eq(rules.exchange_ts_us("", 0, now), nil, "empty time")

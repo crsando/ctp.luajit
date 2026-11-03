@@ -43,10 +43,15 @@ local function days_from_civil(y, m, d)
     return era * 146097 + doe - 719468
 end
 
+-- 本机时钟和交易所时间允许的偏差：行情最多比本机时间晚这么多（本机时钟慢）
+M.CLOCK_SKEW = 300
+
 -- 交易所时间（微秒）。只用 UpdateTime 和毫秒，日期取本机的北京日期：
--- ActionDay 不可靠（大商所夜盘填的是下一个交易日）。行情时间和本机时间
--- 相差超过半天，说明跨了零点：23:59:59 的行情在 00:00:01 收到算前一天，
--- 反过来算后一天。时间格式不对时返回 nil。
+-- ActionDay、TradingDay 各有交易所填错（见 docs/md-time-fields.md）。
+-- 行情不会来自未来：按本机当天算出的时间比本机时间晚超过 CLOCK_SKEW，就是
+-- 前一天的（订阅时补发的旧快照、23:59:59 的行情在 00:00:01 收到）；比本机时间
+-- 早 24 小时减 CLOCK_SKEW 以上，就是本机时钟慢、行情已经过了零点，算后一天。
+-- 时间格式不对时返回 nil。
 function M.exchange_ts_us(update_time, ms, now_us)
     local h, m, s = tostring(update_time):match("^(%d%d):(%d%d):(%d%d)$")
     if not h then return nil end
@@ -56,9 +61,9 @@ function M.exchange_ts_us(update_time, ms, now_us)
     local bj = math.floor(now_us / 1000000) + BJ
     local day = math.floor(bj / DAY)
     local diff = sec - (bj - day * DAY)
-    if diff > DAY / 2 then
+    if diff > M.CLOCK_SKEW then
         day = day - 1
-    elseif diff < -DAY / 2 then
+    elseif diff <= M.CLOCK_SKEW - DAY then
         day = day + 1
     end
     return ((day * DAY + sec - BJ) * 1000 + ms) * 1000
