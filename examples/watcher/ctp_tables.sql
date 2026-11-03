@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS ctp_tick (
     open_interest LONG,
     bid_price1 DOUBLE, bid_volume1 LONG,
     ask_price1 DOUBLE, ask_volume1 LONG,
-    received_at TIMESTAMP            -- collector 收到的本机时间
+    insert_at TIMESTAMP              -- db_writer 执行 flush 的本机时间，同一批相同
 ) TIMESTAMP(ts) PARTITION BY DAY WAL;
 
 -- 日表：每个合约每个交易日一行，重复写入按 (ts, symbol) 覆盖为最新。

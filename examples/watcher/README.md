@@ -2,7 +2,7 @@
 
 一个基于 LuaJIT、CTP 和 QuestDB 的期货行情采集程序。项目使用
 `service` 将行情采集、交易查询和数据库写入拆分成独立 service：启动后连接
-CTP，查询可用期货合约，订阅行情，过滤后批量写入 QuestDB。
+CTP，查询可用期货合约，订阅行情，把每个 tick 批量写入 QuestDB。
 
 本目录属于 `ctp.luajit` 主仓库，没有独立的包管理清单。
 运行前需要先安装并配置项目依赖，以及 CTP 柜台和 QuestDB 网络连接。
@@ -12,8 +12,8 @@ CTP，查询可用期货合约，订阅行情，过滤后批量写入 QuestDB。
 ```text
 entry.lua                          根 service（service.root）
     |-- ctp.templates.trader      连接交易前置，查询合约
-    |-- collector.lua             连接行情前置（ctp.templates.collector），过滤 tick，每 100ms 批量转发
-    `-- db_writer.lua             写入 QuestDB：ctp_tick、ctp_daily
+    |-- collector.lua             连接行情前置（ctp.templates.collector），每个 tick 原样转发
+    `-- db_writer.lua             整理成行，批量写入 QuestDB：ctp_tick、ctp_daily
 ```
 
 根 service 的启动流程如下：
@@ -22,18 +22,19 @@ entry.lua                          根 service（service.root）
    从 `~/.ctp.luajit/accounts.lua` 读取对应的 collector 和 trader 配置；
    任一缺失则报错退出（退出码 1）。
 2. 启动 `db_writer`、`collector` 和 `trader`。
-3. 等待交易 service 建立连接并查询期货合约，把合约的交易所交给 `collector`（写日表用）。
+3. 把行情登录的交易日交给 `db_writer`；等待交易 service 建立连接并查询期货合约，
+   把合约的交易所交给 `db_writer`（写日表用）。
 4. 每 10 个合约一批调用行情 service 的 `subscribe`。
-5. `collector` 过滤 tick，每 100ms 把一批发给 `db_writer`。
+5. `collector` 把每个 tick 原样发给 `db_writer`，由它整理成行、攒批写库。
 
 ## 目录结构
 
 | 路径 | 作用 |
 | --- | --- |
 | [`entry.lua`](entry.lua) | 入口脚本兼根 service，可选传入账户组名；编排子 service 的生命周期、定时启停和订阅流程 |
-| [`collector.lua`](collector.lua) | 行情 service：过滤没有变化的 tick 和旧快照，批量转发 tick 和日表行 |
-| [`db_writer.lua`](db_writer.lua) | 写入 QuestDB 表 `ctp_tick`、`ctp_daily`，设计见 [`db_writer.md`](db_writer.md) |
-| [`tick_rules.lua`](tick_rules.lua) | 时间戳、过滤、行格式等纯函数；测试 [`tick_rules_test.lua`](tick_rules_test.lua) |
+| [`collector.lua`](collector.lua) | 行情 service：每个 tick 原样转发给 `db_writer` |
+| [`db_writer.lua`](db_writer.lua) | 把 tick 整理成行，批量写入 QuestDB 表 `ctp_tick`、`ctp_daily`，设计见 [`db_writer.md`](db_writer.md) |
+| [`tick_rules.lua`](tick_rules.lua) | 时间戳、无效值、日表列映射等纯函数；测试 [`tick_rules_test.lua`](tick_rules_test.lua) |
 | [`ctp_tables.sql`](ctp_tables.sql) | 建表语句 |
 | [`lua/ctp/templates/collector.lua`](../../lua/ctp/templates/collector.lua) | 行情模板：连接 CTP 行情前置、订阅/取消订阅、调用 `on_tick` |
 | [`lua/ctp/templates/trader.lua`](../../lua/ctp/templates/trader.lua) | 交易前置、查询请求队列和订单状态管理 |
@@ -120,7 +121,7 @@ CTP 柜台提供。不要将真实账户文件提交到 Git，也不要把密码
 
 ## QuestDB
 
-行情写进两张表，设计、列说明和过滤规则见 [`db_writer.md`](db_writer.md)：
+行情写进两张表，设计和列说明见 [`db_writer.md`](db_writer.md)：
 
 - `ctp_tick`：每个有变化的 tick 一行，只有一档（最新价、累计成交量和成交额、持仓量、
   买一卖一价量），外加交易日和本机接收时间；
@@ -128,8 +129,7 @@ CTP 柜台提供。不要将真实账户文件提交到 Git，也不要把密码
   按 `(ts, symbol)` upsert。
 
 第一次运行前先在 QuestDB 执行 [`ctp_tables.sql`](ctp_tables.sql) 建表。
-`collector` 先过滤掉没有变化的 tick 和订阅时的旧快照，每 100ms 打包一批发给
-`db_writer`。旧表 `ctp_md_buffer`、`ctp_tmp` 不再写入。
+入库时不做过滤，重复快照、订阅时的旧快照都原样保存，清洗放到下游。旧表 `ctp_md_buffer`、`ctp_tmp` 不再写入。
 
 `ts` 的日期取本机的北京日期（不用 `ActionDay`，大商所夜盘填的是下一个交易日），
 所以**本机时钟要准**。
@@ -212,9 +212,15 @@ SERVICE_LOG_LEVEL=debug luajit entry.lua
 - `unsubscribe(symbol)` 或 `unsubscribe({ ... })`：取消订阅；
 - `quit()`：停止 service。
 
-collector 由 [`collector.lua`](collector.lua) 实现：在 `ctp.templates.collector` 上加了过滤和批量转发，
-每 100ms 调用一次 `db_writer.on_ticks(trading_day, rows)`，日表行通过 `db_writer.on_daily(list)` 发送。
-另有 `set_exchanges(map)`（`start_all` 传入合约的交易所）和 `stats()`（本节的过滤计数）。
+collector 由 [`collector.lua`](collector.lua) 实现：`ctp.templates.collector` 加一个 `on_tick`，
+每个 tick 调用 `service.send("db_writer", "on_tick", tick)`。
+
+### `db_writer`
+
+- `on_tick(tick)`：整理成一行放进待发队列，每 1000 行或 1 秒 flush 一批（`insert_at` 为 flush 的时间）；
+- `set_trading_day(day)`、`set_exchanges(map)`：`start_all` 传入交易日和合约的交易所；
+- `flush()`：写日表并 flush（`stop_all` 调用）；
+- `quit()`：写日表、最后 flush 一次后退出。
 
 ### `trader`
 
@@ -237,12 +243,12 @@ collector 由 [`collector.lua`](collector.lua) 实现：在 `ctp.templates.colle
 - 账户路径和默认 QuestDB 地址目前都写在代码约定中；账户组名可作为 `entry.lua` 的命令行参数指定。
 - `start_all` 不检查 `start` 的返回值；`query_instrument` 失败时（周末、节假日的定时启动，前置未开放）
   记录错误日志并跳过订阅。
-- 根 service 会根据交易查询结果订阅全部期货合约。collector 会过滤没有变化的 tick 并批量转发，
-  写入量见 [`db_writer.md`](db_writer.md)。
-- 时间格式不对的 tick 在 collector 里跳过；`db_writer` 一行写到一半失败时清空 buffer（最多 `batch_size` 条或 1 秒的数据）；flush 失败时丢弃该批。这些情况都会记录日志。
+- 根 service 会根据交易查询结果订阅全部期货合约，每个 tick 一条 service 消息。QuestDB 慢时
+  tick 在 `db_writer` 的 mailbox 里排队，mailbox 自动扩容、不丢消息，日志里会有 `mailbox may overload` 警告。
+- 时间格式不对的 tick 在 `db_writer` 里跳过；`db_writer` 一行写到一半失败时清空 buffer（最多 `batch_size` 条或 1 秒的数据）；flush 失败时丢弃该批。这些情况都会记录日志。
 - libctpc 默认会改造 CTP 库的输出：CTP 自身的打印并入日志（`[ctp]` 前缀），采集终端信息时
   `lshw` / `dmidecode` 的报错被丢弃。这只是隐藏报错：非 root 运行或未装 dmidecode 时，
   上报的终端信息仍不完整。详见根目录 [README](../../README.md) 的特别提示。
-- 时间戳、过滤和行格式的规则在 `tick_rules.lua`，离线测试 `tick_rules_test.lua` 包含在根目录的 `make test` 里。
-  collector 的批量转发和 db_writer 的写库没有离线测试，改动后应在仿真柜台和测试表上做端到端验证
-  （simnow-7x24 是回放行情，要给 collector 传 `stale_ms = 0`）。
+- 时间戳和无效值的规则在 `tick_rules.lua`，离线测试 `tick_rules_test.lua` 包含在根目录的 `make test` 里。
+  db_writer 的写库没有离线测试，改动后应在仿真柜台和测试表上做端到端验证（db_writer 的
+  `tick_table` / `daily_table` 可以指到测试表）。

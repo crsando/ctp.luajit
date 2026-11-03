@@ -26,9 +26,11 @@ function S.boot(profile)
     end
     service.log.info("watcher | profile %s", profile)
 
+    -- 每个 tick 一条消息。mailbox 满了会自动翻倍扩容，并打一条 "mailbox may overload"
+    -- 警告：默认初始容量 1024，按每秒几百笔算，db_writer 卡住两三秒就能在日志里看到
     service.spawn { name = "db_writer", source = "@db_writer.lua", config = {} }
 
-    -- 过滤、每 100ms 打包一批转发给 db_writer，见 collector.lua
+    -- 每个 tick 原样转发给 db_writer，见 collector.lua
     service.spawn {
         name = "collector",
         source = "@collector.lua",
@@ -49,6 +51,7 @@ end
 
 function S.start_all()
     service.call("collector", "start")
+    service.call("db_writer", "set_trading_day", service.call("collector", "trading_day"))
     service.call("trader", "start")
 
     local instruments, err = service.call("trader", "query_instrument")
@@ -62,7 +65,7 @@ function S.start_all()
     for _, entry in ipairs(instruments) do
         exchanges[entry.InstrumentID] = entry.ExchangeID
     end
-    service.call("collector", "set_exchanges", exchanges)
+    service.call("db_writer", "set_exchanges", exchanges)
 
     do
         local subs = {}
@@ -87,12 +90,12 @@ end
 function S.stop_all()
     service.call("trader", "stop")
     service.call("collector", "stop")
+    service.call("db_writer", "flush") -- 本节的日表
 end
 
 function S.quit()
     service.log.debug("root is quiting")
-    -- 先停 collector：它把攒着的 tick 和日表发给 db_writer 之后才返回，
-    -- db_writer 再收到 quit，最后一次 flush 能带上这些数据
+    -- 先停 collector，不再有新 tick；db_writer 收到 quit 时写完日表、最后 flush 一次
     service.call("collector", "stop")
     service.send("db_writer", "quit")
     service.send("collector", "quit")

@@ -1,55 +1,9 @@
--- watcher 的行情规则：纯函数，不依赖 service 和 CTP，可离线测试
--- （tick_rules_test.lua）。collector.lua 用它过滤、打包 tick，db_writer.lua
--- 用它的行格式和日表列映射写库。设计见 db_writer.md。
+-- db_writer 用到的纯函数：时间换算、无效值、日表列映射。不依赖 service 和
+-- QuestDB，离线测试见 tick_rules_test.lua。设计见 db_writer.md。
 local M = {}
 
 local BJ = 8 * 3600 -- CTP 时间是北京时间
 local DAY = 86400
-
--- 行情时间与本机时间相差超过这个值，就是订阅时柜台补发的旧快照，不进 tick 表
-M.STALE_US = 5 * 60 * 1000000
-
--- tick 表的一行：collector 把多行平铺在一个数组里发给 db_writer，
--- 每行 STRIDE 个值，按下面的顺序。不用带键的表，省掉每行的键名打包。
-M.ROW = {
-    "symbol",        -- InstrumentID
-    "ts",            -- 交易所时间，微秒
-    "received_at",   -- 本机收到的时间，微秒
-    "last_price",    -- LastPrice
-    "volume",        -- Volume，当日累计
-    "turnover",      -- Turnover，当日累计
-    "open_interest", -- OpenInterest
-    "bid_price1", "bid_volume1",
-    "ask_price1", "ask_volume1",
-}
-M.STRIDE = #M.ROW
-
--- 把一行追加到平铺数组 rows（已有 n 个值），返回新的 n
-function M.append(rows, n, tick, ts, received_at)
-    rows[n + 1] = tick.InstrumentID
-    rows[n + 2] = ts
-    rows[n + 3] = received_at
-    rows[n + 4] = tick.LastPrice
-    rows[n + 5] = tick.Volume
-    rows[n + 6] = tick.Turnover
-    rows[n + 7] = tick.OpenInterest
-    rows[n + 8] = tick.BidPrice1
-    rows[n + 9] = tick.BidVolume1
-    rows[n + 10] = tick.AskPrice1
-    rows[n + 11] = tick.AskVolume1
-    return n + M.STRIDE
-end
-
--- 和上一笔相比，tick 表关心的字段有没有变化。成交额随成交量变，不单独比较。
-function M.changed(prev, tick)
-    return prev.LastPrice ~= tick.LastPrice
-        or prev.Volume ~= tick.Volume
-        or prev.OpenInterest ~= tick.OpenInterest
-        or prev.BidPrice1 ~= tick.BidPrice1
-        or prev.BidVolume1 ~= tick.BidVolume1
-        or prev.AskPrice1 ~= tick.AskPrice1
-        or prev.AskVolume1 ~= tick.AskVolume1
-end
 
 --
 -- 无效值：CTP 用 DBL_MAX 表示“没有”，空档位、没成交过的合约也会给 0。
@@ -119,9 +73,8 @@ end
 
 --
 -- 日表：每个合约每个交易日一行，当天不变或只关心最终值的字段
---
-
 -- { 列名, CTP 字段名, 类型 }，类型是上面的 price / amount / int
+--
 M.DAILY = {
     { "pre_settlement_price", "PreSettlementPrice", "price" },
     { "pre_close_price", "PreClosePrice", "price" },
@@ -137,19 +90,5 @@ M.DAILY = {
     { "turnover", "Turnover", "amount" },
     { "open_interest", "OpenInterest", "int" },
 }
-
--- collector 发给 db_writer 的日表行：只带日表要的字段
-function M.daily(tick, exchange, trading_day, ts)
-    local d = {
-        symbol = tick.InstrumentID,
-        exchange = exchange,
-        trading_day = trading_day,
-        updated_at = ts, -- 取自哪一笔 tick（交易所时间，微秒）
-    }
-    for _, c in ipairs(M.DAILY) do
-        d[c[2]] = tick[c[2]]
-    end
-    return d
-end
 
 return M
